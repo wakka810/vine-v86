@@ -295,6 +295,54 @@ pub static mut cpuid_level: u32 = 0x16;
 
 pub static mut jit_block_boundary: bool = false;
 
+const VINE_STOP_BUDGET: u32 = 1;
+const VINE_STOP_HALT: u32 = 2;
+const VINE_STOP_EXECUTE_PROTECTION: u32 = 3;
+const VINE_STOP_EXCEPTION_BASE: u32 = 0x100;
+const VINE_JIT_MIN_BUDGET: u32 = 4096;
+
+static mut vine_execution_active: bool = false;
+static mut vine_validated_execute_page: u32 = u32::MAX;
+static mut vine_stop_reason: u32 = 0;
+static mut vine_stop_error_code: i32 = -1;
+static mut vine_jit_instruction_limit_value: u32 = u32::MAX;
+static mut vine_jit_retired_instructions: u64 = 0;
+static mut vine_interpreted_retired_instructions: u64 = 0;
+pub static mut vine_jit_exact_instruction_budget: bool = true;
+
+unsafe fn vine_stop_exception(code: i32, error_code: Option<i32>) -> bool {
+    if !vine_execution_active {
+        return false;
+    }
+
+    vine_stop_reason = VINE_STOP_EXCEPTION_BASE | code as u32;
+    vine_stop_error_code = error_code.unwrap_or(-1);
+    true
+}
+
+#[inline(always)]
+unsafe fn vine_validate_execute_fetch(address: u32) -> OrPageFault<()> {
+    if !vine_execution_active {
+        return Ok(());
+    }
+
+    let page = address >> 12;
+    if page == vine_validated_execute_page {
+        return Ok(());
+    }
+    if crate::cpu::vine::execute_fetch_allowed(address) {
+        vine_validated_execute_page = page;
+        return Ok(());
+    }
+
+    vine_stop_reason = VINE_STOP_EXECUTE_PROTECTION;
+    // x86 PFEC: present | user | instruction fetch.
+    vine_stop_error_code = 0x15;
+    *cr.offset(2) = address as i32;
+    *instruction_pointer = *previous_ip;
+    Err(())
+}
+
 const TSC_ENABLE_IMPRECISE_BROWSER_WORKAROUND: bool = true;
 
 #[cfg(debug_assertions)]
@@ -2121,7 +2169,7 @@ pub unsafe fn do_page_walk(
                 | if for_writing { PAGE_TABLE_DIRTY_MASK } else { 0 };
 
             if side_effects && page_dir_entry != new_page_dir_entry {
-                memory::write8(page_dir_addr, new_page_dir_entry);
+                memory::write8_no_mmap_or_dirty_check(page_dir_addr, new_page_dir_entry);
             }
 
             high = if pae {
@@ -2173,13 +2221,16 @@ pub unsafe fn do_page_walk(
             // Note: dirty bit is only set on the page table entry
             let new_page_dir_entry = page_dir_entry | PAGE_TABLE_ACCESSED_MASK;
             if side_effects && new_page_dir_entry != page_dir_entry {
-                memory::write8(page_dir_addr, new_page_dir_entry);
+                memory::write8_no_mmap_or_dirty_check(page_dir_addr, new_page_dir_entry);
             }
             let new_page_table_entry = page_table_entry
                 | PAGE_TABLE_ACCESSED_MASK
                 | if for_writing { PAGE_TABLE_DIRTY_MASK } else { 0 };
+            if side_effects && for_writing {
+                crate::cpu::vine::mark_guest_page_dirty(addr as u32);
+            }
             if side_effects && page_table_entry != new_page_table_entry {
-                memory::write8(page_table_addr, new_page_table_entry);
+                memory::write8_no_mmap_or_dirty_check(page_table_addr, new_page_table_entry);
             }
 
             high = page_table_entry as u32 & 0xFFFFF000;
@@ -2355,6 +2406,9 @@ pub unsafe fn exit_jit() {
             return;
         },
     };
+    if vine_stop_exception(code, error_code) {
+        return;
+    }
     if DEBUG {
         if js::cpu_exception_hook(code) {
             return;
@@ -2403,6 +2457,9 @@ pub unsafe fn trigger_pagefault(addr: i32, present: bool, write: bool, user: boo
     }
     else {
         *instruction_pointer = *previous_ip;
+        if vine_stop_exception(CPU_EXCEPTION_PF, Some(error_code)) {
+            return;
+        }
         call_interrupt_vector(CPU_EXCEPTION_PF, false, Some(error_code));
     }
 }
@@ -2479,6 +2536,7 @@ pub const DISABLE_EIP_TRANSLATION_OPTIMISATION: bool = false;
 
 pub unsafe fn read_imm8() -> OrPageFault<i32> {
     let eip = *instruction_pointer;
+    vine_validate_execute_fetch(eip as u32)?;
     if DISABLE_EIP_TRANSLATION_OPTIMISATION || 0 != eip & !0xFFF ^ *last_virt_eip {
         *eip_phys = (translate_address_read(eip)? ^ eip as u32) as i32;
         *last_virt_eip = eip & !0xFFF
@@ -3022,7 +3080,9 @@ pub unsafe fn run_instruction(opcode: i32) { gen::interpreter::run(opcode as u32
 pub unsafe fn run_instruction0f_16(opcode: i32) { gen::interpreter0f::run(opcode as u32) }
 pub unsafe fn run_instruction0f_32(opcode: i32) { gen::interpreter0f::run(opcode as u32 | 0x100) }
 
-pub unsafe fn cycle_internal() {
+pub unsafe fn cycle_internal() { cycle_internal_with_budget(u32::MAX) }
+
+unsafe fn cycle_internal_with_budget(interpreter_budget: u32) {
     profiler::stat_increment(stat::CYCLE_INTERNAL);
     let mut jit_entry = None;
     let initial_eip = *instruction_pointer;
@@ -3065,6 +3125,9 @@ pub unsafe fn cycle_internal() {
             }
         },
     }
+    if interpreter_budget < VINE_JIT_MIN_BUDGET {
+        jit_entry = None;
+    }
 
     if let Some((wasm_table_index, initial_state)) = jit_entry {
         if jit::CHECK_JIT_STATE_INVARIANTS {
@@ -3083,10 +3146,14 @@ pub unsafe fn cycle_internal() {
         {
             in_jit = true;
         }
+        vine_jit_instruction_limit_value = interpreter_budget;
         wasm::call_indirect1(
             wasm_table_index as i32 + WASM_TABLE_OFFSET as i32,
             initial_state,
         );
+        vine_jit_instruction_limit_value = u32::MAX;
+        vine_jit_retired_instructions = vine_jit_retired_instructions
+            .wrapping_add((*instruction_counter - initial_instruction_counter) as u64);
         #[cfg(debug_assertions)]
         {
             in_jit = false;
@@ -3129,49 +3196,63 @@ pub unsafe fn cycle_internal() {
         }
     }
     else {
-        *previous_ip = initial_eip;
-        let phys_addr = return_on_pagefault!(get_phys_eip());
+        #[inline(never)]
+        unsafe fn run_interpreted(
+            interpreter_budget: u32,
+            initial_eip: i32,
+            initial_state_flags: CachedStateFlags,
+        ) {
+            *previous_ip = initial_eip;
+            let phys_addr = return_on_pagefault!(get_phys_eip());
 
-        match tlb_code[(initial_eip as u32 >> 12) as usize] {
-            None => {},
-            Some(c) => {
-                let c = c.as_ref();
+            match tlb_code[(initial_eip as u32 >> 12) as usize] {
+                None => {},
+                Some(c) => {
+                    let c = c.as_ref();
 
-                if initial_state_flags == c.state_flags
-                    && c.state_table[initial_eip as usize & 0xFFF] != u16::MAX
-                {
-                    profiler::stat_increment(stat::RUN_INTERPRETED_PAGE_HAS_ENTRY_AFTER_PAGE_WALK);
-                    return;
-                }
-            },
-        }
-
-        #[cfg(feature = "profiler")]
-        {
-            if CHECK_MISSED_ENTRY_POINTS {
-                jit::check_missed_entry_points(phys_addr, initial_state_flags);
+                    if interpreter_budget >= VINE_JIT_MIN_BUDGET
+                        && initial_state_flags == c.state_flags
+                        && c.state_table[initial_eip as usize & 0xFFF] != u16::MAX
+                    {
+                        profiler::stat_increment(
+                            stat::RUN_INTERPRETED_PAGE_HAS_ENTRY_AFTER_PAGE_WALK,
+                        );
+                        return;
+                    }
+                },
             }
+
+            #[cfg(feature = "profiler")]
+            {
+                if CHECK_MISSED_ENTRY_POINTS {
+                    jit::check_missed_entry_points(phys_addr, initial_state_flags);
+                }
+            }
+
+            let initial_instruction_counter = *instruction_counter;
+            jit_run_interpreted(phys_addr, interpreter_budget);
+            vine_interpreted_retired_instructions = vine_interpreted_retired_instructions
+                .wrapping_add((*instruction_counter - initial_instruction_counter) as u64);
+
+            jit::jit_increase_hotness_and_maybe_compile(
+                initial_eip,
+                phys_addr,
+                get_seg_cs() as u32,
+                initial_state_flags,
+                *instruction_counter - initial_instruction_counter,
+            );
+
+            profiler::stat_increment_by(
+                stat::RUN_INTERPRETED_STEPS,
+                (*instruction_counter - initial_instruction_counter) as u64,
+            );
+            dbg_assert!(
+                *instruction_counter != initial_instruction_counter,
+                "Instruction counter didn't change"
+            );
         }
 
-        let initial_instruction_counter = *instruction_counter;
-        jit_run_interpreted(phys_addr);
-
-        jit::jit_increase_hotness_and_maybe_compile(
-            initial_eip,
-            phys_addr,
-            get_seg_cs() as u32,
-            initial_state_flags,
-            *instruction_counter - initial_instruction_counter,
-        );
-
-        profiler::stat_increment_by(
-            stat::RUN_INTERPRETED_STEPS,
-            (*instruction_counter - initial_instruction_counter) as u64,
-        );
-        dbg_assert!(
-            *instruction_counter != initial_instruction_counter,
-            "Instruction counter didn't change"
-        );
+        run_interpreted(interpreter_budget, initial_eip, initial_state_flags);
     };
 }
 
@@ -3186,7 +3267,7 @@ pub unsafe fn get_phys_eip() -> OrPageFault<u32> {
     return Ok(phys_addr);
 }
 
-unsafe fn jit_run_interpreted(mut phys_addr: u32) {
+unsafe fn jit_run_interpreted(mut phys_addr: u32, instruction_limit: u32) {
     profiler::stat_increment(stat::RUN_INTERPRETED);
     dbg_assert!(!memory::in_mapped_range(phys_addr));
 
@@ -3205,13 +3286,18 @@ unsafe fn jit_run_interpreted(mut phys_addr: u32) {
 
         i += 1;
         let start_eip = *instruction_pointer;
+        if vine_validate_execute_fetch(start_eip as u32).is_err() {
+            break;
+        }
         let opcode = *memory::mem8.offset(phys_addr as isize) as i32;
         *instruction_pointer += 1;
         dbg_assert!(*prefixes == 0);
         run_instruction(opcode | (*is_32 as i32) << 8);
         dbg_assert!(*prefixes == 0);
 
-        if jit_block_boundary
+        if (vine_execution_active && vine_stop_reason != 0)
+            || i >= instruction_limit
+            || jit_block_boundary
             || Page::page_of(start_eip as u32) != Page::page_of(*instruction_pointer as u32)
                 // Limit the number of iterations, as jumps within the same page are not counted as
                 // block boundaries for the interpreter, but only on the next backwards jump
@@ -3313,10 +3399,63 @@ pub unsafe fn do_many_cycles_native() {
     }
 }
 
+#[no_mangle]
+pub unsafe fn vine_jit_retired_instructions_low() -> u32 {
+    vine_jit_retired_instructions as u32
+}
+
+#[no_mangle]
+pub unsafe fn vine_jit_retired_instructions_high() -> u32 {
+    (vine_jit_retired_instructions >> 32) as u32
+}
+
+#[no_mangle]
+pub unsafe fn vine_interpreted_retired_instructions_low() -> u32 {
+    vine_interpreted_retired_instructions as u32
+}
+
+#[no_mangle]
+pub unsafe fn vine_interpreted_retired_instructions_high() -> u32 {
+    (vine_interpreted_retired_instructions >> 32) as u32
+}
+
+#[no_mangle]
+pub unsafe fn vine_jit_instruction_limit() -> u32 {
+    if vine_execution_active { vine_jit_instruction_limit_value } else { u32::MAX }
+}
+
+#[no_mangle]
+pub unsafe fn vine_execute_budget(max_instructions: u32) -> u32 {
+    vine_validated_execute_page = u32::MAX;
+    vine_execution_active = true;
+    vine_stop_reason = 0;
+    vine_stop_error_code = -1;
+    let initial_instruction_counter = *instruction_counter;
+    while (*instruction_counter).wrapping_sub(initial_instruction_counter) < max_instructions
+        && !*in_hlt
+        && vine_stop_reason == 0
+    {
+        let executed = (*instruction_counter).wrapping_sub(initial_instruction_counter);
+        cycle_internal_with_budget(max_instructions - executed);
+    }
+
+    if vine_stop_reason == 0 {
+        vine_stop_reason = if *in_hlt { VINE_STOP_HALT } else { VINE_STOP_BUDGET };
+    }
+    vine_execution_active = false;
+    vine_stop_reason
+}
+
+#[no_mangle]
+pub unsafe fn vine_get_stop_error_code() -> i32 { vine_stop_error_code }
+
 #[cold]
 pub unsafe fn trigger_de() {
     dbg_log!("#de");
     *instruction_pointer = *previous_ip;
+    if vine_stop_exception(CPU_EXCEPTION_DE, None) {
+        return;
+    }
     if DEBUG {
         if js::cpu_exception_hook(CPU_EXCEPTION_DE) {
             return;
@@ -3330,6 +3469,9 @@ pub unsafe fn trigger_ud() {
     dbg_log!("#ud");
     dbg_trace();
     *instruction_pointer = *previous_ip;
+    if vine_stop_exception(CPU_EXCEPTION_UD, None) {
+        return;
+    }
     if DEBUG {
         if js::cpu_exception_hook(CPU_EXCEPTION_UD) {
             return;
@@ -3343,6 +3485,9 @@ pub unsafe fn trigger_nm() {
     dbg_log!("#nm eip={:x}", *previous_ip);
     dbg_trace();
     *instruction_pointer = *previous_ip;
+    if vine_stop_exception(CPU_EXCEPTION_NM, None) {
+        return;
+    }
     if DEBUG {
         if js::cpu_exception_hook(CPU_EXCEPTION_NM) {
             return;
@@ -3355,6 +3500,9 @@ pub unsafe fn trigger_nm() {
 pub unsafe fn trigger_gp(code: i32) {
     dbg_log!("#gp");
     *instruction_pointer = *previous_ip;
+    if vine_stop_exception(CPU_EXCEPTION_GP, Some(code)) {
+        return;
+    }
     if DEBUG {
         if js::cpu_exception_hook(CPU_EXCEPTION_GP) {
             return;
@@ -4436,6 +4584,9 @@ pub unsafe fn get_valid_global_tlb_entries_count() -> i32 {
 pub unsafe fn trigger_np(code: i32) {
     dbg_log!("#np");
     *instruction_pointer = *previous_ip;
+    if vine_stop_exception(CPU_EXCEPTION_NP, Some(code)) {
+        return;
+    }
     if DEBUG {
         if js::cpu_exception_hook(CPU_EXCEPTION_NP) {
             return;
@@ -4448,6 +4599,9 @@ pub unsafe fn trigger_np(code: i32) {
 pub unsafe fn trigger_ss(code: i32) {
     dbg_log!("#ss");
     *instruction_pointer = *previous_ip;
+    if vine_stop_exception(CPU_EXCEPTION_SS, Some(code)) {
+        return;
+    }
     if DEBUG {
         if js::cpu_exception_hook(CPU_EXCEPTION_SS) {
             return;

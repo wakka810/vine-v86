@@ -720,8 +720,8 @@ const encodings = [
     { sse: 1, opcode: 0x660FD5, e: 1, custom: 1 },
 
     { sse: 1, opcode: 0x660FD6, e: 1, custom: 1 },
-    { sse: 1, opcode: 0xF20FD6, mem_ud: 1, e: 1 },
-    { sse: 1, opcode: 0xF30FD6, mem_ud: 1, e: 1 },
+    { sse: 1, opcode: 0xF20FD6, mem_ud: 1, e: 1, custom: 1 },
+    { sse: 1, opcode: 0xF30FD6, mem_ud: 1, e: 1, custom: 1 },
     { sse: 1, opcode: 0x0FD6, e: 1, block_boundary: 1 }, // ud
 
     { sse: 1, opcode: 0x0FD7, e: 1, mem_ud: 1, custom: 1 },

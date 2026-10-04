@@ -39,7 +39,6 @@ enum FunctionType {
     FN1_RET,
     FN2_RET,
 
-    FN1_RET_I64,
     FN1_F32_RET,
     FN1_F64_RET,
 
@@ -315,13 +314,6 @@ impl WasmBuilder {
                     self.output.push(op::TYPE_I32);
                     self.output.push(1);
                     self.output.push(op::TYPE_I32);
-                },
-                FunctionType::FN1_RET_I64 => {
-                    self.output.push(op::TYPE_FUNC);
-                    self.output.push(1);
-                    self.output.push(op::TYPE_I32);
-                    self.output.push(1);
-                    self.output.push(op::TYPE_I64);
                 },
                 FunctionType::FN1_F32_RET => {
                     self.output.push(op::TYPE_FUNC);
@@ -684,6 +676,12 @@ impl WasmBuilder {
         self.load_aligned_i64(0);
     }
 
+    pub fn load_fixed_v128(&mut self, addr: u32) {
+        dbg_assert!((addr & 15) == 0);
+        self.const_i32(addr as i32);
+        self.load_aligned_v128(0);
+    }
+
     pub fn load_u8(&mut self, byte_offset: u32) {
         self.instruction_body.push(op::OP_I32LOAD8U);
         self.instruction_body.push(op::MEM_NO_ALIGN);
@@ -732,6 +730,12 @@ impl WasmBuilder {
         write_leb_u32(&mut self.instruction_body, byte_offset);
     }
 
+    pub fn load_aligned_v128(&mut self, byte_offset: u32) {
+        self.simd(op::SIMD_V128_LOAD);
+        self.instruction_body.push(op::MEM_ALIGN128);
+        write_leb_u32(&mut self.instruction_body, byte_offset);
+    }
+
     pub fn load_aligned_u16(&mut self, byte_offset: u32) {
         self.instruction_body.push(op::OP_I32LOAD16U);
         self.instruction_body.push(op::MEM_ALIGN16);
@@ -759,6 +763,12 @@ impl WasmBuilder {
     pub fn store_aligned_i64(&mut self, byte_offset: u32) {
         self.instruction_body.push(op::OP_I64STORE);
         self.instruction_body.push(op::MEM_ALIGN64);
+        write_leb_u32(&mut self.instruction_body, byte_offset);
+    }
+
+    pub fn store_aligned_v128(&mut self, byte_offset: u32) {
+        self.simd(op::SIMD_V128_STORE);
+        self.instruction_body.push(op::MEM_ALIGN128);
         write_leb_u32(&mut self.instruction_body, byte_offset);
     }
 
@@ -799,6 +809,33 @@ impl WasmBuilder {
     pub fn mul_i64(&mut self) { self.instruction_body.push(op::OP_I64MUL); }
     pub fn div_i64(&mut self) { self.instruction_body.push(op::OP_I64DIVU); }
     pub fn rem_i64(&mut self) { self.instruction_body.push(op::OP_I64REMU); }
+
+    fn simd(&mut self, opcode: u8) {
+        self.instruction_body.push(op::OP_SIMD);
+        write_leb_u32(&mut self.instruction_body, opcode as u32);
+    }
+
+    pub fn i8x16_shuffle(&mut self, lanes: [u8; 16]) {
+        self.simd(op::SIMD_I8X16_SHUFFLE);
+        self.instruction_body.extend(lanes);
+    }
+    pub fn v128_const(&mut self, bytes: [u8; 16]) {
+        self.simd(op::SIMD_V128_CONST);
+        self.instruction_body.extend(bytes);
+    }
+    pub fn bitselect_v128(&mut self) { self.simd(op::SIMD_V128_BITSELECT); }
+    pub fn lt_f32x4(&mut self) { self.simd(op::SIMD_F32X4_LT); }
+    pub fn trunc_sat_f32x4_s(&mut self) { self.simd(op::SIMD_I32X4_TRUNC_SAT_F32X4_S); }
+    pub fn i8x16_narrow_i16x8_u(&mut self) { self.simd(op::SIMD_I8X16_NARROW_I16X8_U); }
+    pub fn i16x8_narrow_i32x4_s(&mut self) { self.simd(op::SIMD_I16X8_NARROW_I32X4_S); }
+    pub fn shr_s_i16x8(&mut self) { self.simd(op::SIMD_I16X8_SHR_S); }
+    pub fn shr_u_i16x8(&mut self) { self.simd(op::SIMD_I16X8_SHR_U); }
+    pub fn add_i16x8(&mut self) { self.simd(op::SIMD_I16X8_ADD); }
+    pub fn sub_i16x8(&mut self) { self.simd(op::SIMD_I16X8_SUB); }
+    pub fn mul_i16x8(&mut self) { self.simd(op::SIMD_I16X8_MUL); }
+    pub fn add_f32x4(&mut self) { self.simd(op::SIMD_F32X4_ADD); }
+    pub fn sub_f32x4(&mut self) { self.simd(op::SIMD_F32X4_SUB); }
+    pub fn mul_f32x4(&mut self) { self.simd(op::SIMD_F32X4_MUL); }
 
     pub fn rotl_i32(&mut self) { self.instruction_body.push(op::OP_I32ROTL); }
 
@@ -944,7 +981,6 @@ impl WasmBuilder {
     pub fn call_fn0_ret_i64(&mut self, name: &str) { self.call_fn(name, FunctionType::FN0_RET_I64) }
     pub fn call_fn1(&mut self, name: &str) { self.call_fn(name, FunctionType::FN1) }
     pub fn call_fn1_ret(&mut self, name: &str) { self.call_fn(name, FunctionType::FN1_RET) }
-    pub fn call_fn1_ret_i64(&mut self, name: &str) { self.call_fn(name, FunctionType::FN1_RET_I64) }
     pub fn call_fn1_f32_ret(&mut self, name: &str) { self.call_fn(name, FunctionType::FN1_F32_RET) }
     pub fn call_fn1_f64_ret(&mut self, name: &str) { self.call_fn(name, FunctionType::FN1_F64_RET) }
     pub fn call_fn2(&mut self, name: &str) { self.call_fn(name, FunctionType::FN2) }
