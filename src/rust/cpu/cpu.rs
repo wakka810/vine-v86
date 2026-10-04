@@ -3307,6 +3307,21 @@ unsafe fn jit_run_interpreted(mut phys_addr: u32, instruction_limit: u32) {
             break;
         }
 
+        // A slice can start inside a compiled block. Hand its next loop iteration
+        // back to the cache without interpreting the rest of a large budget.
+        if start_eip as u32 >= *instruction_pointer as u32
+            && instruction_limit - i >= VINE_JIT_MIN_BUDGET
+        {
+            if let Some(code) = tlb_code[(*instruction_pointer as u32 >> 12) as usize] {
+                let code = code.as_ref();
+                if code.state_flags == *state_flags
+                    && code.state_table[*instruction_pointer as usize & 0xFFF] != u16::MAX
+                {
+                    break;
+                }
+            }
+        }
+
         *previous_ip = *instruction_pointer;
         phys_addr = return_on_pagefault!(get_phys_eip()) as u32;
     }

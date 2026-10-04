@@ -575,6 +575,8 @@ fn jit_find_basic_blocks(
 
             dbg_assert!(Page::page_of(current_address) == Page::page_of(addr_before_instruction));
             let current_virt_addr = to_visit & !0xFFF | current_address as i32 & 0xFFF;
+            let instruction_virt_addr =
+                to_visit as u32 & !0xFFF | addr_before_instruction & 0xFFF;
 
             if analysis.ty == AnalysisType::STI && is_near_end_of_page(current_address) {
                 // cut off before the STI so that it is handled by interpreted mode
@@ -639,6 +641,12 @@ fn jit_find_basic_blocks(
                             + (current_virt_addr - cpu.cs_offset as i32 + offset & 0xFFFF)
                     };
 
+                    if jump_target as u32 <= instruction_virt_addr
+                        && Page::page_of(jump_target as u32) == Page::page_of(to_visit as u32)
+                    {
+                        marked_as_entry.insert(jump_target);
+                    }
+
                     dbg_assert!(has_next_instruction);
                     to_visit_stack.push(current_virt_addr);
 
@@ -683,6 +691,12 @@ fn jit_find_basic_blocks(
                         cpu.cs_offset as i32
                             + (current_virt_addr - cpu.cs_offset as i32 + offset & 0xFFFF)
                     };
+
+                    if jump_target as u32 <= instruction_virt_addr
+                        && Page::page_of(jump_target as u32) == Page::page_of(to_visit as u32)
+                    {
+                        marked_as_entry.insert(jump_target);
+                    }
 
                     if has_next_instruction {
                         // Execution will eventually come back to the next instruction (CALL)
