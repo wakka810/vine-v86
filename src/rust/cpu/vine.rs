@@ -133,16 +133,12 @@ pub unsafe fn mark_guest_page_dirty(address: u32) {
         DIRTY_PAGE_OVERFLOWED = true;
         return;
     }
-    *(&raw mut DIRTY_PAGES)
-        .cast::<u32>()
-        .add(DIRTY_PAGE_COUNT) = page << X86_PAGE_SHIFT;
+    *(&raw mut DIRTY_PAGES).cast::<u32>().add(DIRTY_PAGE_COUNT) = page << X86_PAGE_SHIFT;
     DIRTY_PAGE_COUNT += 1;
 }
 
 #[no_mangle]
-pub unsafe fn vine_dirty_pages_ptr() -> u32 {
-    (&raw mut DIRTY_PAGES).cast::<u32>() as u32
-}
+pub unsafe fn vine_dirty_pages_ptr() -> u32 { (&raw mut DIRTY_PAGES).cast::<u32>() as u32 }
 
 #[no_mangle]
 pub unsafe fn vine_dirty_page_count() -> u32 { DIRTY_PAGE_COUNT as u32 }
@@ -183,12 +179,14 @@ pub unsafe fn vine_cpu_state_save() {
     for index in 0..8 {
         put(GPR_BASE + index, *reg32.add(index) as u32);
         put(SREG_BASE + index, *sreg.add(index) as u32);
-        put(SEGMENT_OFFSET_BASE + index, *segment_offsets.add(index) as u32);
+        put(
+            SEGMENT_OFFSET_BASE + index,
+            *segment_offsets.add(index) as u32,
+        );
         put(SEGMENT_LIMIT_BASE + index, *segment_limits.add(index));
         put(
             SEGMENT_META_BASE + index,
-            *segment_access_bytes.add(index) as u32
-                | (*segment_is_null.add(index) as u32) << 8,
+            *segment_access_bytes.add(index) as u32 | (*segment_is_null.add(index) as u32) << 8,
         );
         put(CR_BASE + index, *cr.add(index) as u32);
         put(DREG_BASE + index, *dreg.add(index) as u32);
@@ -286,8 +284,8 @@ pub unsafe fn vine_cpu_state_restore() -> u32 {
     *sysenter_eip = get(SYSENTER_EIP) as i32;
 
     for index in 0..4 {
-        *reg_pdpte.add(index) = get(PDPTE_BASE + index * 2) as u64
-            | (get(PDPTE_BASE + index * 2 + 1) as u64) << 32;
+        *reg_pdpte.add(index) =
+            get(PDPTE_BASE + index * 2) as u64 | (get(PDPTE_BASE + index * 2 + 1) as u64) << 32;
     }
 
     *idtr_offset = get(IDTR_OFFSET) as i32;

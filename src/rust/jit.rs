@@ -465,7 +465,8 @@ fn jit_find_basic_blocks(
         if !pages.contains(&phys_page) {
             // page seen for the first time, handle entry points
             if !target_only {
-                let Some((hotness, entry_points)) = ctx.entry_points.get_mut(&phys_page) else {
+                let Some((hotness, entry_points)) = ctx.entry_points.get_mut(&phys_page)
+                else {
                     // no entry points: ignore this page?
                     page_blacklist.insert(phys_page);
                     return None;
@@ -575,8 +576,7 @@ fn jit_find_basic_blocks(
 
             dbg_assert!(Page::page_of(current_address) == Page::page_of(addr_before_instruction));
             let current_virt_addr = to_visit & !0xFFF | current_address as i32 & 0xFFF;
-            let instruction_virt_addr =
-                to_visit as u32 & !0xFFF | addr_before_instruction & 0xFFF;
+            let instruction_virt_addr = to_visit as u32 & !0xFFF | addr_before_instruction & 0xFFF;
 
             if analysis.ty == AnalysisType::STI && is_near_end_of_page(current_address) {
                 // cut off before the STI so that it is handled by interpreted mode
@@ -1433,9 +1433,10 @@ fn jit_generate_module(
                         ctx.builder.const_i32(state_flags.to_u32() as i32);
                         ctx.builder.eq_i32();
                         ctx.builder.get_local(&code);
-                        ctx.builder.load_aligned_u16(
-                            std::mem::offset_of!(cpu::Code, wasm_table_index) as u32,
-                        );
+                        ctx.builder
+                            .load_aligned_u16(
+                                std::mem::offset_of!(cpu::Code, wasm_table_index) as u32
+                            );
                         ctx.builder.const_i32(wasm_table_index.to_u16() as i32);
                         ctx.builder.eq_i32();
                         ctx.builder.and_i32();
@@ -1448,9 +1449,8 @@ fn jit_generate_module(
                         ctx.builder.const_i32(1);
                         ctx.builder.shl_i32();
                         ctx.builder.add_i32();
-                        ctx.builder.load_aligned_u16(
-                            std::mem::offset_of!(cpu::Code, state_table) as u32,
-                        );
+                        ctx.builder
+                            .load_aligned_u16(std::mem::offset_of!(cpu::Code, state_table) as u32);
                         ctx.builder.tee_local(target_block);
                         ctx.builder.const_i32(u16::MAX as i32);
                         ctx.builder.ne_i32();

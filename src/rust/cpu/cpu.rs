@@ -3415,9 +3415,7 @@ pub unsafe fn do_many_cycles_native() {
 }
 
 #[no_mangle]
-pub unsafe fn vine_jit_retired_instructions_low() -> u32 {
-    vine_jit_retired_instructions as u32
-}
+pub unsafe fn vine_jit_retired_instructions_low() -> u32 { vine_jit_retired_instructions as u32 }
 
 #[no_mangle]
 pub unsafe fn vine_jit_retired_instructions_high() -> u32 {
@@ -3436,7 +3434,12 @@ pub unsafe fn vine_interpreted_retired_instructions_high() -> u32 {
 
 #[no_mangle]
 pub unsafe fn vine_jit_instruction_limit() -> u32 {
-    if vine_execution_active { vine_jit_instruction_limit_value } else { u32::MAX }
+    if vine_execution_active {
+        vine_jit_instruction_limit_value
+    }
+    else {
+        u32::MAX
+    }
 }
 
 #[no_mangle]

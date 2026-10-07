@@ -276,13 +276,11 @@ fn sse_truncate_f32x4(ctx: &mut JitContext, source: u32, destination: u32) {
     ctx.builder.const_i32(destination as i32);
     ctx.builder.load_fixed_v128(source);
     ctx.builder.trunc_sat_f32x4_s();
-    ctx.builder.v128_const([
-        0, 0, 0, 0x80, 0, 0, 0, 0x80, 0, 0, 0, 0x80, 0, 0, 0, 0x80,
-    ]);
+    ctx.builder
+        .v128_const([0, 0, 0, 0x80, 0, 0, 0, 0x80, 0, 0, 0, 0x80, 0, 0, 0, 0x80]);
     ctx.builder.load_fixed_v128(source);
-    ctx.builder.v128_const([
-        0, 0, 0, 0x4f, 0, 0, 0, 0x4f, 0, 0, 0, 0x4f, 0, 0, 0, 0x4f,
-    ]);
+    ctx.builder
+        .v128_const([0, 0, 0, 0x4f, 0, 0, 0, 0x4f, 0, 0, 0, 0x4f, 0, 0, 0, 0x4f]);
     ctx.builder.lt_f32x4();
     ctx.builder.bitselect_v128();
     ctx.builder.store_aligned_v128(0);
@@ -310,8 +308,7 @@ fn mmx_transition(ctx: &mut JitContext) {
         .store_u8(global_pointers::fpu_stack_empty as u32);
     ctx.builder.const_i32(0);
     ctx.builder.const_i32(0);
-    ctx.builder
-        .store_u8(global_pointers::fpu_stack_ptr as u32);
+    ctx.builder.store_u8(global_pointers::fpu_stack_ptr as u32);
 }
 
 fn mmx_finish_write64(ctx: &mut JitContext, destination: u32) {
@@ -6504,7 +6501,12 @@ pub fn instr_0F6B_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 pub fn instr_660F60_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     let source = global_pointers::sse_scratch_register as u32;
     codegen::gen_modrm_resolve_safe_read128(ctx, modrm_byte, source);
-    sse_binary_v128(ctx, source, global_pointers::get_reg_xmm_offset(r), unpack_low_bytes);
+    sse_binary_v128(
+        ctx,
+        source,
+        global_pointers::get_reg_xmm_offset(r),
+        unpack_low_bytes,
+    );
 }
 pub fn instr_660F60_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_binary_v128(
@@ -6517,7 +6519,12 @@ pub fn instr_660F60_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 pub fn instr_660F61_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     let source = global_pointers::sse_scratch_register as u32;
     codegen::gen_modrm_resolve_safe_read128(ctx, modrm_byte, source);
-    sse_binary_v128(ctx, source, global_pointers::get_reg_xmm_offset(r), unpack_low_words);
+    sse_binary_v128(
+        ctx,
+        source,
+        global_pointers::get_reg_xmm_offset(r),
+        unpack_low_words,
+    );
 }
 pub fn instr_660F61_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_binary_v128(
@@ -6616,7 +6623,12 @@ pub fn instr_660F68_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 pub fn instr_660F69_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     let source = global_pointers::sse_scratch_register as u32;
     codegen::gen_modrm_resolve_safe_read128(ctx, modrm_byte, source);
-    sse_binary_v128(ctx, source, global_pointers::get_reg_xmm_offset(r), unpack_high_words);
+    sse_binary_v128(
+        ctx,
+        source,
+        global_pointers::get_reg_xmm_offset(r),
+        unpack_high_words,
+    );
 }
 pub fn instr_660F69_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_binary_v128(
@@ -6846,7 +6858,12 @@ pub fn instr_660F71_2_mem_jit(ctx: &mut JitContext, _modrm_byte: ModrmByte, _imm
 }
 pub fn instr_660F71_2_reg_jit(ctx: &mut JitContext, r: u32, imm8: u32) {
     if imm8 < 16 {
-        sse_shift_v128(ctx, global_pointers::get_reg_xmm_offset(r), imm8, WasmBuilder::shr_u_i16x8);
+        sse_shift_v128(
+            ctx,
+            global_pointers::get_reg_xmm_offset(r),
+            imm8,
+            WasmBuilder::shr_u_i16x8,
+        );
     }
     else {
         ctx.builder.const_i32(r as i32);
