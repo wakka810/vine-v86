@@ -71,6 +71,7 @@ pub const WASM_MODULE_ARGUMENT_COUNT: u8 = 1;
 pub struct WasmBuilder {
     output: Vec<u8>,
     instruction_body: Vec<u8>,
+    imported_call_count: usize,
 
     idx_import_table_size: usize, // for rewriting once finished
     idx_import_count: usize,      // for rewriting once finished
@@ -125,6 +126,7 @@ impl WasmBuilder {
 
             import_table_size: 2,
             import_count: 0,
+            imported_call_count: 0,
 
             initial_static_size: 0,
 
@@ -162,6 +164,7 @@ impl WasmBuilder {
         self.set_import_table_size(2);
         self.set_import_count(0);
         self.instruction_body.clear();
+        self.imported_call_count = 0;
         self.free_locals_i32.clear();
         self.free_locals_i64.clear();
         self.local_count = 0;
@@ -974,7 +977,10 @@ impl WasmBuilder {
         let i = self.get_fn_idx(name, function);
         self.instruction_body.push(op::OP_CALL);
         write_leb_u32(&mut self.instruction_body, i as u32);
+        self.imported_call_count += 1;
     }
+
+    pub fn imported_call_count(&self) -> usize { self.imported_call_count }
 
     pub fn call_fn0(&mut self, name: &str) { self.call_fn(name, FunctionType::FN0) }
     pub fn call_fn0_ret(&mut self, name: &str) { self.call_fn(name, FunctionType::FN0_RET) }

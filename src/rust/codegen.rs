@@ -1468,6 +1468,11 @@ pub fn gen_task_switch_test(ctx: &mut JitContext) {
 }
 
 pub fn gen_task_switch_test_mmx(ctx: &mut JitContext) {
+    // Within this basic block CR0 can change only through an imported helper.
+    // Even a cold memory/MMIO helper invalidates the previously emitted check.
+    if ctx.mmx_task_switch_call_count == Some(ctx.builder.imported_call_count()) {
+        return;
+    }
     // generate if(cr[0] & (CR0_EM | CR0_TS)) { task_switch_test_mmx_jit(); goto exit_with_fault; }
     let cr0_offset = global_pointers::get_creg_offset(0);
 
@@ -1487,6 +1492,7 @@ pub fn gen_task_switch_test_mmx(ctx: &mut JitContext) {
         ctx.builder.br(ctx.exit_with_fault_label);
     }
     ctx.builder.block_end();
+    ctx.mmx_task_switch_call_count = Some(ctx.builder.imported_call_count());
 }
 
 pub fn gen_push16(ctx: &mut JitContext, value_local: &WasmLocal) {

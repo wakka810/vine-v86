@@ -36,7 +36,7 @@ const entry_wrapper = new WebAssembly.Module(new Uint8Array([
 
 function create_cpu(code, {
     disable_jit = false, exact = true, cpu_module = module, paging = false, asynchronous = false,
-    on_finalize = null,
+    on_finalize = null, on_mmap = null,
 } = {})
 {
     const table = new WebAssembly.Table({ element: "anyfunc", initial: TABLE_OFFSET + 900 });
@@ -45,7 +45,7 @@ function create_cpu(code, {
     let last_entry;
     let last_limit;
     const counts = { entries: 0, reads: 0, modules: 0, invalidations: 0,
-        jit_slow_writes: 0, jit_slow_reads: 0 };
+        jit_slow_writes: 0, jit_slow_reads: 0, mmx_guards: 0, mmap: 0 };
     const virtual_base = paging ? VIRTUAL_BASE : 0;
     const env = { __indirect_function_table: table };
     for(const imported of WebAssembly.Module.imports(cpu_module))
@@ -69,11 +69,26 @@ function create_cpu(code, {
                 case "console_log_from_wasm":
                     throw new Error(new TextDecoder().decode(
                         new Uint8Array(wasm.memory.buffer, args[0], args[1])));
+                case "mmap_read8":
+                case "mmap_read32":
+                case "mmap_write8":
+                case "mmap_write16":
+                case "mmap_write32":
+                    assert(on_mmap, "MMIO requires an explicit test adapter");
+                    counts.mmap++;
+                    return on_mmap(imported.name, args, wasm);
                 case "codegen_finalize": {
                     if(on_finalize) on_finalize(wasm);
                     const [index, start, state_flags, pointer, length] = args;
-                    const generated = new WebAssembly.Module(
-                        new Uint8Array(wasm.memory.buffer, pointer, length));
+                    const bytes = Buffer.from(wasm.memory.buffer, pointer, length);
+                    // Count the generated CR0 byte-load/mask/if sequence. The
+                    // focused fixture also witnesses its compiled entry and
+                    // compares architectural state; this count proves elision.
+                    const guard = Buffer.from([0x41, 0xc4, 0x04, 0x2d, 0, 0, 0x41, 12, 0x71, 4, 0x40]);
+                    counts.mmx_guards = 0;
+                    for(let index = bytes.indexOf(guard); index >= 0; index = bytes.indexOf(guard, index + 1))
+                        counts.mmx_guards++;
+                    const generated = new WebAssembly.Module(bytes);
                     const f = new WebAssembly.Instance(generated, { e: jit_imports }).exports.f;
                     const wrapped = new WebAssembly.Instance(entry_wrapper, {
                         e: { f, enter: () => counts.entries++ },
@@ -261,6 +276,7 @@ function create_pair(code, options = {}, {
     const baseline = baseline_module && create_cpu(code, { ...options, cpu_module: baseline_module });
     return {
         jit,
+        baseline,
         cpus: [jit, interpreted, ...(baseline ? [baseline] : [])],
         execute(budget, description, { compare_instructions = true } = {}) {
             const actual = jit.execute(budget);
@@ -797,6 +813,101 @@ console.log("disabled exact-budget mode: no getter passed");
     }
     assert.equal(restored.registers[0], 0x66778899);
     console.log("stopped resume: full CR3/thread restoration retains flush and all 153 words passed");
+}
+
+function update_cpu_words(cpu, update)
+{
+    cpu.wasm.vine_cpu_state_save();
+    update(new Uint32Array(cpu.wasm.memory.buffer, cpu.wasm.vine_cpu_state_ptr(), 153));
+    assert.equal(cpu.wasm.vine_cpu_state_restore(), 0);
+}
+
+// INC; MOVQ mm1,mm0; MOVDQA xmm2,xmm1; JMP. The first SIMD guard
+// remains after INC, and two register-only instructions share its success.
+const register_simd = [0x40, 0x0f, 0x6f, 0xc8, 0x66, 0x0f, 0x6f, 0xd1, 0xeb, 0xf6];
+function seed_simd(cpu)
+{
+    update_cpu_words(cpu, state => {
+        state[62] |= 0x200; // CR4.OSFXSR
+        state[97] = 0x12345678; // MM0 mantissa
+        state[98] = 0x9abcdef0;
+        state[99] = 0xffff;
+        state.set([0x11223344, 0x55667788, 0x99aabbcc, 0xddeeff00], 125); // XMM1
+    });
+}
+
+{
+    const { jit, baseline, cpus, execute } = create_pair(register_simd);
+    for(const cpu of cpus) seed_simd(cpu);
+    execute(132000, "register SIMD aligned warmup");
+    assert.equal(jit.counts.modules, 1);
+    assert.equal(jit.counts.mmx_guards, 1, "a compiled register run retains only its first guard");
+    if(baseline) assert.equal(baseline.counts.mmx_guards, 2);
+    const entries = jit.counts.entries;
+    for(const budget of [0, 1, 2, 3, 4, 5, 4095, 4096, 4097])
+        assert.equal(execute(budget, `register SIMD budget ${budget}`).instructions, budget);
+    assert(jit.counts.entries > entries, "the reduced guard sequence must execute cached code");
+    const state = jit.full_snapshot().state;
+    assert.deepEqual(state.slice(100, 102), [0x12345678, 0x9abcdef0]); // MM1
+    assert.deepEqual(state.slice(129, 133), state.slice(125, 129)); // XMM2
+    console.log("SIMD register guards: actual elision, exact budgets and strict baseline state passed");
+}
+
+for(const [name, bits, reason] of [["EM", 4, 0x106], ["TS", 8, 0x107], ["EM+TS", 12, 0x106]])
+{
+    const { jit, cpus, execute } = create_pair(register_simd);
+    for(const cpu of cpus) seed_simd(cpu);
+    execute(132000, `${name}: warm SIMD`);
+    for(const cpu of cpus)
+    {
+        update_cpu_words(cpu, state => { state[58] |= bits; });
+        cpu.resume();
+    }
+    const entries = jit.counts.entries;
+    const result = execute(64, `${name}: first SIMD fault`, { compare_instructions: false });
+    assert.equal(result.reason, reason);
+    assert.equal(result.eip, START + 1, "INC executes before the first SIMD exception");
+    assert(jit.counts.entries > entries, "the restored CR0 must be checked by cached code");
+    assert.equal(jit.full_snapshot().state[11], START, "JIT fault retains the baseline previous IP");
+    assert.equal(cpus[1].full_snapshot().state[11], START + 1, "interpreter publishes the faulting IP");
+}
+
+// A real MMIO read callback changes CR0.TS inside the first SIMD memory
+// instruction. The following register instruction must perform a fresh check.
+{
+    let armed = false;
+    const code = [0x40, 0x0f, 0x6f, 0xc8, 0x0f, 0x6f, 0x07, 0x0f, 0x6f, 0xd8, 0xeb, 0xf4];
+    const { jit, baseline, cpus, execute } = create_pair(code, {
+        on_mmap(name, _args, wasm) {
+            assert.equal(name, "mmap_read32");
+            if(armed)
+            {
+                const memory = new DataView(wasm.memory.buffer);
+                memory.setUint32(580, memory.getUint32(580, true) | 8, true);
+            }
+            return 0x11223344;
+        },
+    });
+    for(const cpu of cpus)
+    {
+        seed_simd(cpu);
+        cpu.set_register(7, 0xa0000);
+    }
+    execute(132000, "MMIO SIMD aligned warmup");
+    assert.equal(jit.counts.mmx_guards, 2, "memory helper emission breaks guard reuse");
+    if(baseline) assert.equal(baseline.counts.mmx_guards, 3);
+    for(const cpu of cpus) cpu.resume();
+    armed = true;
+    const entries = jit.counts.entries;
+    const accesses = jit.counts.mmap;
+    const result = execute(64, "MMIO changes TS before next SIMD", { compare_instructions: false });
+    assert.equal(result.reason, 0x107);
+    assert.equal(result.eip, START + 7);
+    assert(jit.counts.entries > entries && jit.counts.mmap > accesses,
+        "the compiled memory instruction must invoke actual MMIO");
+    assert.equal(jit.full_snapshot().state[11], START);
+    assert.equal(cpus[1].full_snapshot().state[11], START + 7);
+    console.log("SIMD guards: restored EM/TS fault position and MMIO context mutation passed");
 }
 
 const ordinary = create_cpu(loops[0][1]);

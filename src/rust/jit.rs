@@ -346,6 +346,7 @@ pub struct JitContext<'a> {
     pub exit_label: Label,
     pub current_instruction: Instruction,
     pub previous_instruction: Instruction,
+    pub mmx_task_switch_call_count: Option<usize>,
     pub instruction_counter: WasmLocal,
     pub instruction_limit: Option<WasmLocal>,
     pub wasm_table_index: WasmTableIndex,
@@ -1287,6 +1288,7 @@ fn jit_generate_module(
         exit_label,
         current_instruction: Instruction::Other,
         previous_instruction: Instruction::Other,
+        mmx_task_switch_call_count: None,
         instruction_counter,
         instruction_limit,
         wasm_table_index,
@@ -2176,6 +2178,7 @@ fn jit_generate_basic_block(ctx: &mut JitContext, block: &BasicBlock) {
     ctx.cpu.eip = start_addr;
     ctx.current_instruction = Instruction::Other;
     ctx.previous_instruction = Instruction::Other;
+    ctx.mmx_task_switch_call_count = None;
 
     loop {
         let mut instruction = 0;
