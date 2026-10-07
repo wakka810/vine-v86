@@ -3515,10 +3515,10 @@ pub fn instr_D7_jit(ctx: &mut JitContext) {
     codegen::gen_set_reg8(ctx, regs::AL);
 }
 
-fn instr_group_D8_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, op: &str) {
-    ctx.builder.const_i32(0);
-    codegen::gen_fpu_load_m32(ctx, modrm_byte);
-    ctx.builder.call_fn3_i32_i64_i32(op)
+fn instr_group_D8_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, operation: i32) {
+    ctx.builder.const_i32(operation);
+    codegen::gen_modrm_resolve_safe_read32(ctx, modrm_byte);
+    ctx.builder.call_fn2("fpu_op_m32_jit")
 }
 fn instr_group_D8_reg_jit(ctx: &mut JitContext, r: u32, op: &str) {
     ctx.builder.const_i32(0);
@@ -3527,61 +3527,59 @@ fn instr_group_D8_reg_jit(ctx: &mut JitContext, r: u32, op: &str) {
 }
 
 pub fn instr_D8_0_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    instr_group_D8_mem_jit(ctx, modrm_byte, "fpu_fadd")
+    instr_group_D8_mem_jit(ctx, modrm_byte, 0)
 }
 pub fn instr_D8_0_reg_jit(ctx: &mut JitContext, r: u32) {
     instr_group_D8_reg_jit(ctx, r, "fpu_fadd")
 }
 pub fn instr_D8_1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    instr_group_D8_mem_jit(ctx, modrm_byte, "fpu_fmul")
+    instr_group_D8_mem_jit(ctx, modrm_byte, 1)
 }
 pub fn instr_D8_1_reg_jit(ctx: &mut JitContext, r: u32) {
     instr_group_D8_reg_jit(ctx, r, "fpu_fmul")
 }
 pub fn instr_D8_2_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_fpu_load_m32(ctx, modrm_byte);
-    ctx.builder.call_fn2_i64_i32("fpu_fcom")
+    instr_group_D8_mem_jit(ctx, modrm_byte, 2)
 }
 pub fn instr_D8_2_reg_jit(ctx: &mut JitContext, r: u32) {
     codegen::gen_fpu_get_sti(ctx, r);
     ctx.builder.call_fn2_i64_i32("fpu_fcom")
 }
 pub fn instr_D8_3_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_fpu_load_m32(ctx, modrm_byte);
-    ctx.builder.call_fn2_i64_i32("fpu_fcomp")
+    instr_group_D8_mem_jit(ctx, modrm_byte, 3)
 }
 pub fn instr_D8_3_reg_jit(ctx: &mut JitContext, r: u32) {
     codegen::gen_fpu_get_sti(ctx, r);
     ctx.builder.call_fn2_i64_i32("fpu_fcomp")
 }
 pub fn instr_D8_4_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    instr_group_D8_mem_jit(ctx, modrm_byte, "fpu_fsub")
+    instr_group_D8_mem_jit(ctx, modrm_byte, 4)
 }
 pub fn instr_D8_4_reg_jit(ctx: &mut JitContext, r: u32) {
     instr_group_D8_reg_jit(ctx, r, "fpu_fsub")
 }
 pub fn instr_D8_5_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    instr_group_D8_mem_jit(ctx, modrm_byte, "fpu_fsubr")
+    instr_group_D8_mem_jit(ctx, modrm_byte, 5)
 }
 pub fn instr_D8_5_reg_jit(ctx: &mut JitContext, r: u32) {
     instr_group_D8_reg_jit(ctx, r, "fpu_fsubr")
 }
 pub fn instr_D8_6_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    instr_group_D8_mem_jit(ctx, modrm_byte, "fpu_fdiv")
+    instr_group_D8_mem_jit(ctx, modrm_byte, 6)
 }
 pub fn instr_D8_6_reg_jit(ctx: &mut JitContext, r: u32) {
     instr_group_D8_reg_jit(ctx, r, "fpu_fdiv")
 }
 pub fn instr_D8_7_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    instr_group_D8_mem_jit(ctx, modrm_byte, "fpu_fdivr")
+    instr_group_D8_mem_jit(ctx, modrm_byte, 7)
 }
 pub fn instr_D8_7_reg_jit(ctx: &mut JitContext, r: u32) {
     instr_group_D8_reg_jit(ctx, r, "fpu_fdivr")
 }
 
 pub fn instr16_D9_0_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    codegen::gen_fpu_load_m32(ctx, modrm_byte);
-    ctx.builder.call_fn2_i64_i32("fpu_push");
+    codegen::gen_modrm_resolve_safe_read32(ctx, modrm_byte);
+    ctx.builder.call_fn1("fpu_fld_m32_jit");
 }
 pub fn instr16_D9_0_reg_jit(ctx: &mut JitContext, r: u32) {
     codegen::gen_fpu_get_sti(ctx, r);

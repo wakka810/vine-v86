@@ -93,6 +93,31 @@ pub unsafe fn f32_to_f80(v: i32) -> F80 {
     x
 }
 #[no_mangle]
+pub unsafe fn fpu_fld_m32_jit(v: i32) {
+    let scratch = sse_scratch_register as *mut F80;
+    f32_to_f80_jit(scratch, v);
+    fpu_push(*scratch);
+}
+#[no_mangle]
+pub unsafe fn fpu_op_m32_jit(operation: i32, v: i32) {
+    // operation is the decoded D8 /n constant. Preserve each existing helper's
+    // flag handling, including the differences between arithmetic operations.
+    let scratch = sse_scratch_register as *mut F80;
+    f32_to_f80_jit(scratch, v);
+    let x = *scratch;
+    match operation {
+        0 => fpu_fadd(0, x),
+        1 => fpu_fmul(0, x),
+        2 => fpu_fcom(x),
+        3 => fpu_fcomp(x),
+        4 => fpu_fsub(0, x),
+        5 => fpu_fsubr(0, x),
+        6 => fpu_fdiv(0, x),
+        7 => fpu_fdivr(0, x),
+        _ => unreachable!(),
+    }
+}
+#[no_mangle]
 pub unsafe fn f64_to_f80_jit(dst: *mut F80, v: u64) { *dst = f64_to_f80(v) }
 pub unsafe fn f64_to_f80(v: u64) -> F80 {
     F80::clear_exception_flags();

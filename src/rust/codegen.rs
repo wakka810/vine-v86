@@ -2501,17 +2501,6 @@ pub fn gen_fpu_get_sti(ctx: &mut JitContext, i: u32) {
         .load_fixed_u16(global_pointers::sse_scratch_register as u32 + 8);
 }
 
-pub fn gen_fpu_load_m32(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    ctx.builder
-        .const_i32(global_pointers::sse_scratch_register as i32);
-    gen_modrm_resolve_safe_read32(ctx, modrm_byte);
-    ctx.builder.call_fn2("f32_to_f80_jit");
-    ctx.builder
-        .load_fixed_i64(global_pointers::sse_scratch_register as u32);
-    ctx.builder
-        .load_fixed_u16(global_pointers::sse_scratch_register as u32 + 8);
-}
-
 pub fn gen_fpu_load_m64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     ctx.builder
         .const_i32(global_pointers::sse_scratch_register as i32);

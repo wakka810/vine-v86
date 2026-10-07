@@ -45,7 +45,7 @@ function create_cpu(code, {
     let last_entry;
     let last_limit;
     const counts = { entries: 0, reads: 0, modules: 0, invalidations: 0,
-        jit_slow_writes: 0, jit_slow_reads: 0, mmx_guards: 0, mmap: 0 };
+        jit_slow_writes: 0, jit_slow_reads: 0, mmx_guards: 0, mmap: 0, fpu_imports: new Set() };
     const virtual_base = paging ? VIRTUAL_BASE : 0;
     const env = { __indirect_function_table: table };
     for(const imported of WebAssembly.Module.imports(cpu_module))
@@ -89,6 +89,8 @@ function create_cpu(code, {
                     for(let index = bytes.indexOf(guard); index >= 0; index = bytes.indexOf(guard, index + 1))
                         counts.mmx_guards++;
                     const generated = new WebAssembly.Module(bytes);
+                    for(const dependency of WebAssembly.Module.imports(generated))
+                        if(/^(fpu_|f32_to_f80)/.test(dependency.name)) counts.fpu_imports.add(dependency.name);
                     const f = new WebAssembly.Instance(generated, { e: jit_imports }).exports.f;
                     const wrapped = new WebAssembly.Instance(entry_wrapper, {
                         e: { f, enter: () => counts.entries++ },
@@ -842,7 +844,7 @@ function seed_simd(cpu)
     execute(132000, "register SIMD aligned warmup");
     assert.equal(jit.counts.modules, 1);
     assert.equal(jit.counts.mmx_guards, 1, "a compiled register run retains only its first guard");
-    if(baseline) assert.equal(baseline.counts.mmx_guards, 2);
+    if(baseline) assert.equal(baseline.counts.mmx_guards, 1);
     const entries = jit.counts.entries;
     for(const budget of [0, 1, 2, 3, 4, 5, 4095, 4096, 4097])
         assert.equal(execute(budget, `register SIMD budget ${budget}`).instructions, budget);
@@ -868,7 +870,7 @@ for(const [name, bits, reason] of [["EM", 4, 0x106], ["TS", 8, 0x107], ["EM+TS",
     assert.equal(result.reason, reason);
     assert.equal(result.eip, START + 1, "INC executes before the first SIMD exception");
     assert(jit.counts.entries > entries, "the restored CR0 must be checked by cached code");
-    assert.equal(jit.full_snapshot().state[11], START, "JIT fault retains the baseline previous IP");
+    assert.equal(jit.full_snapshot().state[11], START + 1, "JIT publishes the faulting IP");
     assert.equal(cpus[1].full_snapshot().state[11], START + 1, "interpreter publishes the faulting IP");
 }
 
@@ -895,7 +897,7 @@ for(const [name, bits, reason] of [["EM", 4, 0x106], ["TS", 8, 0x107], ["EM+TS",
     }
     execute(132000, "MMIO SIMD aligned warmup");
     assert.equal(jit.counts.mmx_guards, 2, "memory helper emission breaks guard reuse");
-    if(baseline) assert.equal(baseline.counts.mmx_guards, 3);
+    if(baseline) assert.equal(baseline.counts.mmx_guards, 2);
     for(const cpu of cpus) cpu.resume();
     armed = true;
     const entries = jit.counts.entries;
@@ -905,9 +907,183 @@ for(const [name, bits, reason] of [["EM", 4, 0x106], ["TS", 8, 0x107], ["EM+TS",
     assert.equal(result.eip, START + 7);
     assert(jit.counts.entries > entries && jit.counts.mmap > accesses,
         "the compiled memory instruction must invoke actual MMIO");
-    assert.equal(jit.full_snapshot().state[11], START);
+    assert.equal(jit.full_snapshot().state[11], START + 7);
     assert.equal(cpus[1].full_snapshot().state[11], START + 7);
     console.log("SIMD guards: restored EM/TS fault position and MMIO context mutation passed");
+}
+
+// A compiled read can fault before the block's final instruction publishes its
+// previous IP. Repair the mapping and retry the saved faulting instruction.
+{
+    const { jit, cpus, execute } = create_pair([0x40, 0x8B, 0x1F, 0xEB, 0xFB], { paging: true });
+    for(const cpu of cpus) cpu.resume();
+    execute(132000, "read PF: warm");
+    for(const cpu of cpus)
+    {
+        cpu.physical.setUint32(PAGE_TABLE + (DATA >>> 12) * 4, DATA | 6, true);
+        cpu.wasm.full_clear_tlb();
+        cpu.resume();
+    }
+    const entries = jit.counts.entries;
+    const fault = execute(64, "read PF: compiled absent page", { compare_instructions: false });
+    assert.equal(fault.reason, 0x10E);
+    assert.equal(fault.error, 4);
+    assert.equal(fault.eip, VIRTUAL_BASE + START + 1);
+    assert(jit.counts.entries > entries);
+    assert.equal(jit.full_snapshot().state[11], fault.eip);
+    assert.equal(jit.full_snapshot().state[60], VIRTUAL_BASE + DATA);
+    for(const cpu of cpus)
+    {
+        cpu.physical.setUint32(PAGE_TABLE + (DATA >>> 12) * 4, DATA | 7, true);
+        cpu.wasm.full_clear_tlb();
+    }
+    const retry = execute(1, "read PF: repair and retry saved context");
+    assert.equal(retry.registers[0], fault.registers[0], "retry does not duplicate the preceding INC");
+    assert.equal(retry.eip, VIRTUAL_BASE + START + 3);
+    execute(64, "read PF: continue after retry");
+}
+
+function seed_fpu(cpu, bits = 0x3fc00000, { empty = false, full = false, cw = 0x37f } = {})
+{
+    const memory = new DataView(cpu.wasm.memory.buffer);
+    memory.setUint8(816, full ? 0 : empty ? 0xff : 0xf7);
+    memory.setUint8(1032, 3);
+    memory.setUint16(1040, 0x4200, true);
+    for(let register = 0; register < 8; register++)
+    {
+        memory.setBigUint64(1152 + register * 16, 0x8000000000000000n, true);
+        memory.setUint16(1160 + register * 16, 0x3fff, true);
+    }
+    cpu.wasm.set_control_word(cw);
+    new Uint8Array(cpu.wasm.memory.buffer, 1136, 16).fill(0xa5);
+    cpu.physical.setUint32(DATA, bits, true);
+    cpu.resume(0);
+}
+
+function assert_fpu_scratch(jit, baseline, description)
+{
+    if(baseline) assert.deepEqual(
+        Buffer.from(jit.wasm.memory.buffer, 1136, 10),
+        Buffer.from(baseline.wasm.memory.buffer, 1136, 10),
+        `${description}: converted F80 scratch fields`);
+}
+
+// Only m32 memory operations are fused. Exercise every D8 /n and FLD with
+// a cached module, exact C18 architectural/retirement comparisons, and scratch
+// fields that the generated caller formerly reloaded after conversion.
+for(const operation of [null, 0, 1, 2, 3, 4, 5, 6, 7])
+{
+    const name = operation === null ? "FLD m32" : `D8 /${operation} m32`;
+    const code = [0x40, operation === null ? 0xd9 : 0xd8,
+        0x07 | (operation ?? 0) << 3, 0xeb, 0xfb];
+    const { jit, baseline, cpus, execute } = create_pair(code);
+    for(const cpu of cpus) seed_fpu(cpu);
+    execute(132000, `${name}: warm`);
+    assert(jit.counts.entries > 0);
+    assert(jit.counts.fpu_imports.has(operation === null ? "fpu_fld_m32_jit" : "fpu_op_m32_jit"));
+    assert(!jit.counts.fpu_imports.has("f32_to_f80_jit"), "one generated native import replaces the pair");
+    if(baseline) assert(baseline.counts.fpu_imports.has("f32_to_f80_jit"));
+    for(const bits of [0x3fc00000, 0xbf000000, 0, 0x80000000, 1, 0x7f7fffff, 0x7fc01234, 0x7f800001])
+    {
+        for(const cpu of cpus) seed_fpu(cpu, bits);
+        const entries = jit.counts.entries;
+        execute(3, `${name}: input ${bits.toString(16)}`);
+        assert(jit.counts.entries > entries, "the fused operation must actually execute generated code");
+        assert_fpu_scratch(jit, baseline, name);
+    }
+    for(const state of [{ empty: true }, { full: true }])
+    {
+        for(const cpu of cpus) seed_fpu(cpu, 0x7f800001, state);
+        execute(3, `${name}: stack ${state.empty ? "empty" : "full"}`);
+        assert_fpu_scratch(jit, baseline, name);
+    }
+    if(operation === 0 || operation === 6)
+        for(const precision of [0, 2, 3]) for(const rounding of [0, 1, 2, 3])
+        {
+            const cw = 0x7f | precision << 8 | rounding << 10;
+            for(const cpu of cpus) seed_fpu(cpu, 0x3dcccccd, { cw });
+            execute(3, `${name}: precision ${precision}, rounding ${rounding}`);
+            assert_fpu_scratch(jit, baseline, name);
+        }
+    for(const budget of [0, 1, 2, 4095, 4096, 4097])
+    {
+        for(const cpu of cpus) seed_fpu(cpu);
+        execute(budget, `${name}: budget ${budget}`);
+        assert_fpu_scratch(jit, baseline, name);
+    }
+    console.log(`${name}: strict cached conversion, stack, flags, scratch and budgets passed`);
+}
+
+// The #NM guard stays before memory access. On PF neither conversion nor push
+// may run, and repairing the mapping must retry only the saved instruction.
+for(const opcode of [0xd9, 0xd8])
+{
+    const name = opcode === 0xd9 ? "FLD" : "FADD";
+    const { jit, baseline, cpus, execute } = create_pair([0x40, opcode, 7, 0xeb, 0xfb], { paging: true });
+    for(const cpu of cpus) seed_fpu(cpu);
+    execute(132000, `${name}: paged warm`);
+    for(const bits of [4, 8, 12, 0])
+    {
+        for(const cpu of cpus)
+        {
+            seed_fpu(cpu);
+            cpu.physical.setUint32(PAGE_TABLE + (DATA >>> 12) * 4, DATA | 6, true);
+            const memory = new DataView(cpu.wasm.memory.buffer);
+            memory.setUint32(580, 0x80010001 | bits, true);
+            cpu.wasm.full_clear_tlb();
+        }
+        const result = execute(64, `${name}: absent page, EM/TS ${bits}`, { compare_instructions: false });
+        assert.equal(result.reason, bits ? 0x107 : 0x10e);
+        assert.equal(result.eip, VIRTUAL_BASE + START + 1);
+        assert.equal(jit.full_snapshot().state[11], result.eip);
+        assert(Buffer.from(jit.wasm.memory.buffer, 1136, 10).every(byte => byte === 0xa5));
+        assert_fpu_scratch(jit, baseline, name);
+    }
+    for(const cpu of cpus)
+    {
+        cpu.physical.setUint32(PAGE_TABLE + (DATA >>> 12) * 4, DATA | 7, true);
+        cpu.wasm.full_clear_tlb();
+    }
+    const retry = execute(1, `${name}: repair read PF`);
+    assert.equal(retry.registers[0], 1, "fault retry must not duplicate preceding INC");
+    assert.equal(retry.eip, VIRTUAL_BASE + START + 3);
+    assert_fpu_scratch(jit, baseline, name);
+}
+
+// A real MMIO callback updates FPU state and CR0 after the instruction's guard.
+// Complete that first arithmetic operation; the next x87 instruction raises #NM.
+{
+    let armed = false;
+    const { jit, baseline, cpus, execute } = create_pair([0x40, 0xd8, 7, 0xd8, 7, 0xeb, 0xf9], {
+        on_mmap(name, _args, wasm) {
+            assert.equal(name, "mmap_read32");
+            if(armed)
+            {
+                const memory = new DataView(wasm.memory.buffer);
+                memory.setUint8(1032, 5);
+                memory.setUint8(816, 0xdf);
+                memory.setUint16(1040, 0x400, true);
+                memory.setBigUint64(1152 + 5 * 16, 0x8000000000000000n, true);
+                memory.setUint16(1160 + 5 * 16, 0x3ffe, true);
+                memory.setUint32(580, memory.getUint32(580, true) | 8, true);
+            }
+            return 0x3fc00000;
+        },
+    });
+    for(const cpu of cpus) { seed_fpu(cpu); cpu.set_register(7, 0xa0000); }
+    execute(132000, "FPU MMIO warm");
+    for(const cpu of cpus) seed_fpu(cpu);
+    armed = true;
+    const entries = jit.counts.entries, accesses = jit.counts.mmap;
+    const result = execute(64, "FPU MMIO state and next guard", { compare_instructions: false });
+    assert.equal(result.reason, 0x107);
+    assert.equal(result.eip, START + 3);
+    assert(jit.counts.entries > entries && jit.counts.mmap > accesses);
+    const memory = new DataView(jit.wasm.memory.buffer);
+    assert.equal(memory.getUint8(1032), 5);
+    assert.equal(memory.getBigUint64(1152 + 5 * 16, true), 0x8000000000000000n);
+    assert.equal(memory.getUint16(1160 + 5 * 16, true), 0x4000, "first operation completed to 2.0 after MMIO");
+    assert_fpu_scratch(jit, baseline, "FPU MMIO");
 }
 
 const ordinary = create_cpu(loops[0][1]);

@@ -2421,6 +2421,7 @@ pub unsafe fn exit_jit() {
         },
     };
     if vine_stop_exception(code, error_code) {
+        *previous_ip = *instruction_pointer;
         return;
     }
     if DEBUG {
