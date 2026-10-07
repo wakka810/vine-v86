@@ -347,6 +347,7 @@ pub struct JitContext<'a> {
     pub current_instruction: Instruction,
     pub previous_instruction: Instruction,
     pub instruction_counter: WasmLocal,
+    pub instruction_limit: Option<WasmLocal>,
     pub wasm_table_index: WasmTableIndex,
 }
 impl<'a> JitContext<'a> {
@@ -1247,6 +1248,17 @@ fn jit_generate_module(
     builder.const_i32(0);
     let instruction_counter = builder.set_new_local();
 
+    // cycle_internal_with_budget sets the limit before this synchronous invocation
+    // and resets it after we return. Dispatch, helpers, and cache invalidation do
+    // not change it, so every block can use the same invocation-local snapshot.
+    let instruction_limit = if unsafe { cpu::vine_jit_exact_instruction_budget } {
+        builder.call_fn0_ret("vine_jit_instruction_limit");
+        Some(builder.set_new_local())
+    }
+    else {
+        None
+    };
+
     let exit_label = builder.block_void();
     let exit_with_fault_label = builder.block_void();
     let main_loop_label = builder.loop_void();
@@ -1276,6 +1288,7 @@ fn jit_generate_module(
         current_instruction: Instruction::Other,
         previous_instruction: Instruction::Other,
         instruction_counter,
+        instruction_limit,
         wasm_table_index,
     };
 
@@ -2095,6 +2108,9 @@ fn jit_generate_module(
     }
     ctx.builder
         .free_local(ctx.instruction_counter.unsafe_clone());
+    if let Some(local) = ctx.instruction_limit.take() {
+        ctx.builder.free_local(local);
+    }
 
     ctx.builder.finish();
 
@@ -2140,11 +2156,11 @@ fn jit_generate_basic_block(ctx: &mut JitContext, block: &BasicBlock) {
         ctx.builder.call_fn1("enter_basic_block");
     }
 
-    if unsafe { cpu::vine_jit_exact_instruction_budget } {
+    if let Some(limit) = &ctx.instruction_limit {
         ctx.builder.get_local(&ctx.instruction_counter);
         ctx.builder.const_i32(block.number_of_instructions as i32);
         ctx.builder.add_i32();
-        ctx.builder.call_fn0_ret("vine_jit_instruction_limit");
+        ctx.builder.get_local(limit);
         ctx.builder.gtu_i32();
         ctx.builder.if_void();
         codegen::gen_set_eip_low_bits(ctx.builder, block.addr as i32 & 0xFFF);
