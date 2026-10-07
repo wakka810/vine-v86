@@ -144,8 +144,11 @@ function create_cpu(code, {
     return {
         wasm, counts,
         restart_at_entry() {
-            new DataView(wasm.memory.buffer).setUint32(556, virtual_base + START, true);
-            wasm.full_clear_tlb();
+            this.restart_at(START);
+        },
+        restart_at(address, clear_tlb = true) {
+            new DataView(wasm.memory.buffer).setUint32(556, virtual_base + address, true);
+            if(clear_tlb) wasm.full_clear_tlb();
         },
         protect_data_page() {
             assert(paging);
@@ -209,7 +212,9 @@ function create_cpu(code, {
     };
 }
 
-function create_pair(code, options = {})
+function create_pair(code, options = {}, {
+    compare_retired_partition = true, allow_budget_previous_eip = false,
+} = {})
 {
     const jit = create_cpu(code, options);
     const interpreted = create_cpu(code, { ...options, disable_jit: true });
@@ -222,8 +227,30 @@ function create_pair(code, options = {})
             if(baseline)
             {
                 assert.deepEqual(actual, baseline.execute(budget), `${description}: baseline result`);
-                assert.deepEqual(jit.full_snapshot(), baseline.full_snapshot(),
-                    `${description}: complete CPU state, guest memory and retirement counters`);
+                const actual_snapshot = jit.full_snapshot();
+                const expected_snapshot = baseline.full_snapshot();
+                if(compare_retired_partition)
+                {
+                    assert.deepEqual(actual_snapshot, expected_snapshot,
+                        `${description}: complete CPU state, guest memory and retirement counters`);
+                }
+                else
+                {
+                    const { jit: actual_jit, interpreted: actual_interpreted, ...actual_state } = actual_snapshot;
+                    const { jit: expected_jit, interpreted: expected_interpreted, ...expected_state } = expected_snapshot;
+                    if(allow_budget_previous_eip && actual.reason === 1)
+                    {
+                        // Cached split blocks need not publish the previous IP
+                        // at a successful budget exit. Fault/HLT/SMC exits keep
+                        // every raw state word strict, including PREVIOUS_EIP.
+                        actual_state.state = actual_state.state.filter((_, index) => index !== 11);
+                        expected_state.state = expected_state.state.filter((_, index) => index !== 11);
+                    }
+                    assert.deepEqual(actual_state, expected_state,
+                        `${description}: all CPU state words, memory, dirty pages and counter`);
+                    assert.equal(actual_jit + actual_interpreted, expected_jit + expected_interpreted,
+                        `${description}: total retired instructions`);
+                }
             }
             const expected = interpreted.execute(budget);
             if(compare_instructions)
@@ -255,9 +282,26 @@ const loops = [
     ["multiple-entries", [0x40, 0xA8, 1, 0x74, 3, 0x43, 0xFF, 0xE1, 0x4B, 0xFF, 0xE1]],
 ];
 
+function assert_budget_architecture(jit, interpreted, description)
+{
+    const { state, jit: compiled, interpreted: fallback, ...actual } = jit.full_snapshot();
+    const { state: expected_state, jit: expected_compiled,
+        interpreted: expected_fallback, ...expected } = interpreted.full_snapshot();
+    assert.deepEqual(actual, expected, `${description}: memory, dirty pages and counter`);
+    assert.deepEqual(state.filter((_, index) => index !== 11),
+        expected_state.filter((_, index) => index !== 11),
+        `${description}: all state words except successful-budget previous IP`);
+    assert.equal(jit.wasm.get_eflags() >>> 0, interpreted.wasm.get_eflags() >>> 0,
+        `${description}: resolved EFLAGS`);
+    assert.equal(compiled + fallback, expected_compiled + expected_fallback,
+        `${description}: total retirement`);
+}
+
 for(const [name, code] of loops)
 {
-    const { jit, cpus, execute } = create_pair(code);
+    const { jit, cpus, execute } = create_pair(code, {}, {
+        compare_retired_partition: false, allow_budget_previous_eip: true,
+    });
     for(const budget of budgets)
     {
         const actual = execute(budget, `${name}: budget ${budget}`);
@@ -274,6 +318,95 @@ for(const [name, code] of loops)
     console.log(`${name}: exact budgets, wrap, invalidation, getter count passed`);
 }
 
+// An aligned warmup leaves a single 258-instruction block: no interior entry
+// learned from a partial tail. A budget of one must reject it once, execute one
+// NOP interpreted and terminate. Cold TLB discovery must not redispatch forever.
+for(const [name, options, cold] of [
+    ["large block hot tail", {}, false],
+    ["large block paged deferred cold tail", { paging: true, asynchronous: true }, true],
+])
+{
+    const code = new Uint8Array(262).fill(0x90);
+    code[256] = 0x40;
+    code[257] = 0xE9;
+    new DataView(code.buffer).setInt32(258, -262, true);
+    const { jit, cpus, execute } = create_pair(code, options, {
+        compare_retired_partition: false, allow_budget_previous_eip: true,
+    });
+    execute(258 * 400, `${name}: aligned warmup`);
+    await Promise.resolve();
+    assert.equal(jit.counts.modules, 1, "warmup must leave one unsplit cached block");
+    for(const cpu of cpus) cpu.restart_at(START, cold);
+    const before = jit.full_snapshot();
+    const entries = jit.counts.entries;
+    const tiny = execute(1, `${name}: zero-retired rejection`);
+    assert.equal(tiny.reason, 1);
+    assert.equal(tiny.instructions, 1);
+    assert.equal(tiny.eip, (options.paging ? VIRTUAL_BASE : 0) + START + 1);
+    assert.equal(jit.counts.entries - entries, 1, "oversized block is attempted once");
+    const after = jit.full_snapshot();
+    assert.equal(after.jit - before.jit, 0n);
+    assert.equal(after.interpreted - before.interpreted, 1n);
+    assert_budget_architecture(jit, cpus[1], `${name}: tiny fallback`);
+    for(const budget of [0, 2, 257, 258, 259, 4095])
+    {
+        for(const cpu of cpus) cpu.restart_at(START, cold);
+        const result = execute(budget, `${name}: budget ${budget}`);
+        assert.equal(result.reason, 1);
+        assert.equal(result.instructions, budget);
+        assert_budget_architecture(jit, cpus[1], `${name}: budget ${budget}`);
+        await Promise.resolve();
+    }
+    for(const cpu of cpus) cpu.set_counter(0xFFFFFFFE);
+    execute(259, `${name}: tiny tail across counter wrap`);
+    assert_budget_architecture(jit, cpus[1], `${name}: wrapped counter`);
+    jit.assert_hoisted();
+    console.log(`${name}: bounded fallback, exact budgets, full state and wrap passed`);
+}
+
+// Starting on the JMP inside a compiled two-instruction block should interpret
+// that one instruction, then hand its remaining budget of two back to the cache.
+{
+    const { jit, cpus, execute } = create_pair(loops[0][1], {}, {
+        compare_retired_partition: false, allow_budget_previous_eip: true,
+    });
+    execute(100004, "tiny backward reentry: aligned warmup");
+    for(const cpu of cpus) cpu.restart_at(START + 1, false);
+    const before = jit.full_snapshot();
+    const result = execute(3, "tiny backward reentry");
+    assert.equal(result.reason, 1);
+    assert.equal(result.instructions, 3);
+    const after = jit.full_snapshot();
+    assert.equal(after.jit - before.jit, 2n);
+    assert.equal(after.interpreted - before.interpreted, 1n);
+    assert_budget_architecture(jit, cpus[1], "tiny backward reentry");
+    jit.assert_hoisted();
+    console.log("tiny backward reentry: one interpreted jump and two cached instructions passed");
+}
+
+// Rejecting a too-large compiled block must retry a self-modifying store exactly
+// once. The target is in the same executable page but outside the running loop.
+{
+    const target = START + 0x100;
+    const code = [0xA2, 0, 0, 0, 0, 0x40, 0xFF, 0xE1];
+    code[1] = target & 0xFF;
+    code[2] = target >>> 8;
+    const { jit, cpus, execute } = create_pair(code);
+    for(const cpu of cpus) cpu.set_register(0, 0x12);
+    execute(3, "tiny SMC fallback: warmup");
+    const invalidations = jit.counts.invalidations;
+    assert.equal(jit.counts.modules, 1);
+    for(const cpu of cpus) cpu.set_register(0, 0x34);
+    const result = execute(1, "tiny SMC fallback");
+    assert.equal(result.reason, 1);
+    assert.equal(result.instructions, 1);
+    assert.equal(result.eip, START + 5);
+    assert.equal(jit.full_snapshot().state[11], START);
+    assert.equal(jit.full_snapshot().memory[target], 0x34);
+    assert(jit.counts.invalidations > invalidations);
+    console.log("tiny SMC fallback: single store, precise previous IP and invalidation passed");
+}
+
 for(const [name, ending, reason] of [["halt", [0xF4], 2], ["invalid-opcode", [0x0F, 0x0B], 0x106]])
 {
     // inc eax; dec edx; jnz start; ending. Warm the loop, then reach its early exit.
@@ -286,6 +419,26 @@ for(const [name, ending, reason] of [["halt", [0xF4], 2], ["invalid-opcode", [0x
     assert.equal(actual.reason, reason);
     jit.assert_hoisted();
     console.log(`${name}: compiled early exit passed`);
+}
+
+for(const [name, ending, reason] of [["halt", [0xF4], 2], ["invalid-opcode", [0x0F, 0x0B], 0x106]])
+{
+    const code = [0x40, 0x4A, 0x75, 0xFC, ...ending];
+    const { jit, cpus, execute } = create_pair(code, {}, { compare_retired_partition: false });
+    for(const cpu of cpus) cpu.set_register(2, 1000000);
+    execute(131072, `tiny ${name}: warmup`);
+    for(const cpu of cpus) cpu.set_register(2, 7);
+    const result = execute(64, `tiny ${name}`);
+    assert.equal(result.reason, reason);
+    const expected_eip = START + (name === "halt" ? 5 : 4);
+    for(const cpu of cpus)
+    {
+        const state = cpu.full_snapshot().state;
+        assert.equal(state[10], expected_eip, `tiny ${name}: terminal EIP`);
+        assert.equal(state[11], START + 4, `tiny ${name}: terminal previous IP`);
+    }
+    jit.assert_hoisted();
+    console.log(`tiny ${name}: exact terminal state and previous IP passed`);
 }
 
 // After warming, execute the byte store from the compiled module it modifies.
@@ -325,7 +478,8 @@ for(const [name, ending, reason] of [["halt", [0xF4], 2], ["invalid-opcode", [0x
 // Exercise virtual-to-physical translation and the production-style deferred
 // finalize callback, then reject a write from warmed compiled code.
 {
-    const { jit, cpus, execute } = create_pair(loops[1][1], { paging: true, asynchronous: true });
+    const { jit, cpus, execute } = create_pair(loops[1][1], { paging: true, asynchronous: true },
+        { compare_retired_partition: false, allow_budget_previous_eip: true });
     for(const budget of budgets)
     {
         const actual = execute(budget, `paged asynchronous: budget ${budget}`);
@@ -361,6 +515,32 @@ if(baseline_module)
     assert.deepEqual(unchecked.full_snapshot(), baseline.full_snapshot());
 }
 console.log("disabled exact-budget mode: no getter passed");
+
+{
+    const unchecked = create_cpu(loops[0][1], { exact: false });
+    const baseline = baseline_module && create_cpu(loops[0][1], {
+        exact: false, cpu_module: baseline_module,
+    });
+    unchecked.execute(100004);
+    if(baseline) baseline.execute(100004);
+    for(const budget of [0, 1, 31, 4095])
+    {
+        unchecked.restart_at_entry();
+        if(baseline) baseline.restart_at_entry();
+        const entries = unchecked.counts.entries;
+        const result = unchecked.execute(budget);
+        assert.equal(result.reason, 1);
+        assert.equal(result.instructions, budget);
+        assert.equal(unchecked.counts.entries, entries,
+            "unchecked mode must retain the 4096-instruction cache cutoff");
+        if(baseline)
+        {
+            assert.deepEqual(result, baseline.execute(budget));
+            assert.deepEqual(unchecked.full_snapshot(), baseline.full_snapshot());
+        }
+    }
+    console.log("unchecked tiny tails: original cutoff and all 153 state words passed");
+}
 
 const ordinary = create_cpu(loops[0][1]);
 ordinary.execute(131072);

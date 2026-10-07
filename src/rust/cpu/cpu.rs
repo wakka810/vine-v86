@@ -3082,6 +3082,61 @@ pub unsafe fn run_instruction0f_32(opcode: i32) { gen::interpreter0f::run(opcode
 
 pub unsafe fn cycle_internal() { cycle_internal_with_budget(u32::MAX) }
 
+#[inline(never)]
+unsafe fn run_interpreted_with_budget(
+    interpreter_budget: u32,
+    initial_eip: i32,
+    initial_state_flags: CachedStateFlags,
+    allow_cached_entry: bool,
+) {
+    *previous_ip = initial_eip;
+    let phys_addr = return_on_pagefault!(get_phys_eip());
+
+    match tlb_code[(initial_eip as u32 >> 12) as usize] {
+        None => {},
+        Some(c) => {
+            let c = c.as_ref();
+
+            if allow_cached_entry
+                && initial_state_flags == c.state_flags
+                && c.state_table[initial_eip as usize & 0xFFF] != u16::MAX
+            {
+                profiler::stat_increment(stat::RUN_INTERPRETED_PAGE_HAS_ENTRY_AFTER_PAGE_WALK);
+                return;
+            }
+        },
+    }
+
+    #[cfg(feature = "profiler")]
+    {
+        if CHECK_MISSED_ENTRY_POINTS {
+            jit::check_missed_entry_points(phys_addr, initial_state_flags);
+        }
+    }
+
+    let initial_instruction_counter = *instruction_counter;
+    jit_run_interpreted(phys_addr, interpreter_budget);
+    vine_interpreted_retired_instructions = vine_interpreted_retired_instructions
+        .wrapping_add((*instruction_counter - initial_instruction_counter) as u64);
+
+    jit::jit_increase_hotness_and_maybe_compile(
+        initial_eip,
+        phys_addr,
+        get_seg_cs() as u32,
+        initial_state_flags,
+        *instruction_counter - initial_instruction_counter,
+    );
+
+    profiler::stat_increment_by(
+        stat::RUN_INTERPRETED_STEPS,
+        (*instruction_counter - initial_instruction_counter) as u64,
+    );
+    dbg_assert!(
+        *instruction_counter != initial_instruction_counter,
+        "Instruction counter didn't change"
+    );
+}
+
 unsafe fn cycle_internal_with_budget(interpreter_budget: u32) {
     profiler::stat_increment(stat::CYCLE_INTERNAL);
     let mut jit_entry = None;
@@ -3125,7 +3180,9 @@ unsafe fn cycle_internal_with_budget(interpreter_budget: u32) {
             }
         },
     }
-    if interpreter_budget < VINE_JIT_MIN_BUDGET {
+    let allow_cached_entry = interpreter_budget >= VINE_JIT_MIN_BUDGET
+        || interpreter_budget > 0 && vine_jit_exact_instruction_budget;
+    if !allow_cached_entry {
         jit_entry = None;
     }
 
@@ -3158,6 +3215,15 @@ unsafe fn cycle_internal_with_budget(interpreter_budget: u32) {
         {
             in_jit = false;
         }
+        if *instruction_counter == initial_instruction_counter {
+            // The first block can exceed a small remaining budget. Its guard
+            // retires nothing; force one interpreter instruction so we cannot
+            // repeatedly redispatch the same oversized block without progress.
+            if vine_stop_reason == 0 && !*in_hlt {
+                run_interpreted_with_budget(1, *instruction_pointer, *state_flags, false);
+            }
+            return;
+        }
         profiler::stat_increment_by(
             stat::RUN_FROM_CACHE_STEPS,
             (*instruction_counter - initial_instruction_counter) as u64,
@@ -3187,8 +3253,7 @@ unsafe fn cycle_internal_with_budget(interpreter_budget: u32) {
 
         if is_near_end_of_page(*instruction_pointer as u32) {
             profiler::stat_increment(stat::RUN_FROM_CACHE_EXIT_NEAR_END_OF_PAGE);
-        }
-        else if Page::page_of(initial_eip as u32) == Page::page_of(*instruction_pointer as u32) {
+        } else if Page::page_of(initial_eip as u32) == Page::page_of(*instruction_pointer as u32) {
             profiler::stat_increment(stat::RUN_FROM_CACHE_EXIT_SAME_PAGE);
         }
         else {
@@ -3196,63 +3261,12 @@ unsafe fn cycle_internal_with_budget(interpreter_budget: u32) {
         }
     }
     else {
-        #[inline(never)]
-        unsafe fn run_interpreted(
-            interpreter_budget: u32,
-            initial_eip: i32,
-            initial_state_flags: CachedStateFlags,
-        ) {
-            *previous_ip = initial_eip;
-            let phys_addr = return_on_pagefault!(get_phys_eip());
-
-            match tlb_code[(initial_eip as u32 >> 12) as usize] {
-                None => {},
-                Some(c) => {
-                    let c = c.as_ref();
-
-                    if interpreter_budget >= VINE_JIT_MIN_BUDGET
-                        && initial_state_flags == c.state_flags
-                        && c.state_table[initial_eip as usize & 0xFFF] != u16::MAX
-                    {
-                        profiler::stat_increment(
-                            stat::RUN_INTERPRETED_PAGE_HAS_ENTRY_AFTER_PAGE_WALK,
-                        );
-                        return;
-                    }
-                },
-            }
-
-            #[cfg(feature = "profiler")]
-            {
-                if CHECK_MISSED_ENTRY_POINTS {
-                    jit::check_missed_entry_points(phys_addr, initial_state_flags);
-                }
-            }
-
-            let initial_instruction_counter = *instruction_counter;
-            jit_run_interpreted(phys_addr, interpreter_budget);
-            vine_interpreted_retired_instructions = vine_interpreted_retired_instructions
-                .wrapping_add((*instruction_counter - initial_instruction_counter) as u64);
-
-            jit::jit_increase_hotness_and_maybe_compile(
-                initial_eip,
-                phys_addr,
-                get_seg_cs() as u32,
-                initial_state_flags,
-                *instruction_counter - initial_instruction_counter,
-            );
-
-            profiler::stat_increment_by(
-                stat::RUN_INTERPRETED_STEPS,
-                (*instruction_counter - initial_instruction_counter) as u64,
-            );
-            dbg_assert!(
-                *instruction_counter != initial_instruction_counter,
-                "Instruction counter didn't change"
-            );
-        }
-
-        run_interpreted(interpreter_budget, initial_eip, initial_state_flags);
+        run_interpreted_with_budget(
+            interpreter_budget,
+            initial_eip,
+            initial_state_flags,
+            allow_cached_entry,
+        );
     };
 }
 
@@ -3310,7 +3324,7 @@ unsafe fn jit_run_interpreted(mut phys_addr: u32, instruction_limit: u32) {
         // A slice can start inside a compiled block. Hand its next loop iteration
         // back to the cache without interpreting the rest of a large budget.
         if start_eip as u32 >= *instruction_pointer as u32
-            && instruction_limit - i >= VINE_JIT_MIN_BUDGET
+            && (instruction_limit - i >= VINE_JIT_MIN_BUDGET || vine_jit_exact_instruction_budget)
         {
             if let Some(code) = tlb_code[(*instruction_pointer as u32 >> 12) as usize] {
                 let code = code.as_ref();
