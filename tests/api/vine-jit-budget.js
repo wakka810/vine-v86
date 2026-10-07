@@ -36,6 +36,7 @@ const entry_wrapper = new WebAssembly.Module(new Uint8Array([
 
 function create_cpu(code, {
     disable_jit = false, exact = true, cpu_module = module, paging = false, asynchronous = false,
+    on_finalize = null,
 } = {})
 {
     const table = new WebAssembly.Table({ element: "anyfunc", initial: TABLE_OFFSET + 900 });
@@ -43,7 +44,8 @@ function create_cpu(code, {
     let jit_imports;
     let last_entry;
     let last_limit;
-    const counts = { entries: 0, reads: 0, modules: 0, invalidations: 0, jit_slow_writes: 0 };
+    const counts = { entries: 0, reads: 0, modules: 0, invalidations: 0,
+        jit_slow_writes: 0, jit_slow_reads: 0 };
     const virtual_base = paging ? VIRTUAL_BASE : 0;
     const env = { __indirect_function_table: table };
     for(const imported of WebAssembly.Module.imports(cpu_module))
@@ -68,6 +70,7 @@ function create_cpu(code, {
                     throw new Error(new TextDecoder().decode(
                         new Uint8Array(wasm.memory.buffer, args[0], args[1])));
                 case "codegen_finalize": {
+                    if(on_finalize) on_finalize(wasm);
                     const [index, start, state_flags, pointer, length] = args;
                     const generated = new WebAssembly.Module(
                         new Uint8Array(wasm.memory.buffer, pointer, length));
@@ -99,6 +102,10 @@ function create_cpu(code, {
     jit_imports.safe_write8_slow_jit = (...args) => {
         counts.jit_slow_writes++;
         return wasm.safe_write8_slow_jit(...args);
+    };
+    jit_imports.safe_read32s_slow_jit = (...args) => {
+        counts.jit_slow_reads++;
+        return wasm.safe_read32s_slow_jit(...args);
     };
     wasm.rust_init();
     assert.equal(wasm.vine_set_memory_size(MEMORY_SIZE), 0);
@@ -143,6 +150,39 @@ function create_cpu(code, {
 
     return {
         wasm, counts,
+        get physical() { return new DataView(wasm.memory.buffer, physical_base, MEMORY_SIZE); },
+        resume(eax = null, address = START, esp = virtual_base + 0x90000) {
+            if(typeof wasm.vine_cpu_apply_stopped_resume === "function")
+            {
+                assert.equal(wasm.vine_cpu_apply_stopped_resume(
+                    eax ?? 0, Number(eax !== null), esp, virtual_base + address), 0);
+            }
+            else
+            {
+                wasm.vine_cpu_state_save();
+                const saved = new Uint32Array(wasm.memory.buffer, wasm.vine_cpu_state_ptr(), 153);
+                if(eax !== null) saved[2] = eax;
+                saved[6] = esp;
+                saved[10] = saved[11] = virtual_base + address;
+                saved[22] = 0;
+                assert.equal(wasm.vine_cpu_state_restore(), 0);
+            }
+        },
+        clear_dirty(addresses) {
+            assert(paging);
+            for(const address of addresses)
+            {
+                const pte = PAGE_TABLE + (address >>> 12) * 4;
+                this.physical.setUint32(pte, this.physical.getUint32(pte, true) & ~0x40, true);
+            }
+            wasm.vine_reset_dirty_pages();
+            if(typeof wasm.vine_rearm_dirty_page === "function")
+            {
+                for(const address of addresses)
+                    assert.equal(wasm.vine_rearm_dirty_page(virtual_base + address), 0);
+            }
+            else wasm.full_clear_tlb();
+        },
         restart_at_entry() {
             this.restart_at(START);
         },
@@ -540,6 +580,223 @@ console.log("disabled exact-budget mode: no getter passed");
         }
     }
     console.log("unchecked tiny tails: original cutoff and all 153 state words passed");
+}
+
+// A same-context API return must preserve every field outside its five outputs,
+// even when the host staging buffer no longer contains the current CPU state.
+{
+    const cpu = create_cpu([0x90]);
+    const before = cpu.full_snapshot();
+    const staging = new Uint32Array(cpu.wasm.memory.buffer, cpu.wasm.vine_cpu_state_ptr(), 153);
+    for(let index = 2; index < staging.length; index++) staging[index] = 0xa5a50000 + index;
+    cpu.resume(null, START + 1, 0x8fffc);
+    const expected = { ...before, state: [...before.state] };
+    expected.state[6] = 0x8fffc;
+    expected.state[10] = expected.state[11] = START + 1;
+    expected.state[22] = 0;
+    assert.deepEqual(cpu.full_snapshot(), expected, "partial resume preserves all 153 architectural words");
+    cpu.resume(0xfedcba98, START, 0x90000);
+    expected.state[2] = 0xfedcba98;
+    expected.state[6] = 0x90000;
+    expected.state[10] = expected.state[11] = START;
+    assert.deepEqual(cpu.full_snapshot(), expected, "partial resume updates EAX only when requested");
+    assert.equal(cpu.wasm.vine_cpu_apply_stopped_resume(1, 2, 0, 0), 1);
+    assert.equal(cpu.wasm.vine_rearm_dirty_page(DATA + 1), 1);
+    assert.deepEqual(cpu.full_snapshot(), expected, "invalid scalar arguments do not mutate CPU or memory");
+    console.log("stopped resume: poisoned staging, all 153 words and argument rejection passed");
+}
+
+{
+    let cpu;
+    let rejected = 0;
+    cpu = create_cpu([0x90, 0xeb, 0xfd], { on_finalize(wasm) {
+        const before = cpu.full_snapshot();
+        assert.equal(wasm.vine_cpu_apply_stopped_resume(1, 1, 0, 0), 1);
+        assert.equal(wasm.vine_rearm_dirty_page(DATA), 1);
+        assert.deepEqual(cpu.full_snapshot(), before, "active execution rejects both host mutations");
+        rejected++;
+    } });
+    cpu.execute(4096);
+    assert(rejected > 0, "validation must run during an actual JIT-finalize host call");
+    console.log("active CPU: resume and dirty rearm reject without mutation passed");
+}
+
+// Keep hot read/code translations while rearming writes. The unchanged CPU uses
+// full restore/full flush, and every differential snapshot remains fully strict.
+{
+    const bytes = new Uint8Array(256);
+    const imm32 = value => [value & 255, value >>> 8 & 255, value >>> 16 & 255, value >>> 24];
+    bytes.set([0xa1, ...imm32(VIRTUAL_BASE + DATA), 0xeb, 0xf9]);
+    bytes.set([0xa3, ...imm32(VIRTUAL_BASE + DATA), 0xeb, 0xf9], 0x40);
+    bytes.set([0xa3, ...imm32(VIRTUAL_BASE + DATA),
+        0xa3, ...imm32(VIRTUAL_BASE + DATA + 4096), 0xeb, 0xf4], 0x80);
+    const jit = create_cpu(bytes, { paging: true });
+    const baseline = baseline_module && create_cpu(bytes, { paging: true, cpu_module: baseline_module });
+    const cpus = [jit, ...(baseline ? [baseline] : [])];
+    function execute(budget, description) {
+        const actual = jit.execute(budget);
+        if(baseline)
+        {
+            assert.deepEqual(actual, baseline.execute(budget), `${description}: result`);
+            assert.deepEqual(jit.full_snapshot(), baseline.full_snapshot(),
+                `${description}: all 153 state words, memory, dirty pages and retired partition`);
+        }
+        return actual;
+    }
+    for(const cpu of cpus)
+    {
+        cpu.physical.setUint32(DATA, 0x11223344, true);
+        cpu.physical.setUint32(PAGE_TABLE + (DATA >>> 12) * 4 + 4, DATA | 7, true);
+    }
+    execute(4096, "warm read loop");
+    execute(4096, "cached read loop");
+    for(const cpu of cpus) cpu.wasm.full_clear_tlb();
+    execute(64, "cold JIT read translation");
+    assert(jit.counts.entries > 0 && jit.counts.jit_slow_reads > 0);
+    const slow_reads = jit.counts.jit_slow_reads;
+    for(const cpu of cpus)
+    {
+        cpu.clear_dirty([DATA]);
+        cpu.resume();
+    }
+    const read = execute(64, "rearmed cached reads");
+    assert.equal(read.reason, 1);
+    assert.equal(read.registers[0], 0x11223344);
+    assert.equal(jit.counts.jit_slow_reads, slow_reads, "READONLY rearm retains the hot JIT read translation");
+    assert.equal(jit.wasm.vine_rearm_dirty_page(VIRTUAL_BASE + DATA + 8192), 0,
+        "a never-cached virtual page remains invalid");
+
+    for(const cpu of cpus) cpu.resume(0x12345678, START + 0x40);
+    execute(4096, "warm write loop");
+    execute(4096, "cached write loop");
+    const entries = jit.counts.entries;
+    for(const value of [0x22334455, 0x33445566])
+    {
+        for(const cpu of cpus)
+        {
+            cpu.clear_dirty([DATA]);
+            cpu.resume(value, START + 0x40);
+        }
+        const result = execute(2, "successive hot writes");
+        assert.equal(result.reason, 1);
+        assert.equal(result.instructions, 2);
+        assert.equal(jit.physical.getUint32(DATA, true), value);
+        assert.deepEqual(jit.full_snapshot().dirty, [VIRTUAL_BASE + DATA]);
+        assert(jit.physical.getUint32(PAGE_TABLE + (DATA >>> 12) * 4, true) & 0x40);
+    }
+    assert(jit.counts.entries > entries, "both successive writes must execute cached code");
+
+    for(const cpu of cpus) cpu.resume(0x44556677, START + 0x80);
+    execute(4095, "warm aliased writes");
+    execute(4095, "cached aliased writes");
+    for(const cpu of cpus)
+    {
+        cpu.clear_dirty([DATA, DATA + 4096]);
+        cpu.resume(0x55667788, START + 0x80);
+    }
+    execute(3, "rearmed aliased writes");
+    assert.deepEqual(jit.full_snapshot().dirty, [VIRTUAL_BASE + DATA, VIRTUAL_BASE + DATA + 4096]);
+    assert.equal(jit.physical.getUint32(DATA, true), 0x55667788);
+    for(const cpu of cpus)
+    {
+        cpu.clear_dirty([DATA, DATA + 4096]);
+        cpu.protect_data_page();
+        cpu.resume(0xdeadbeef, START + 0x40);
+    }
+    const fault = execute(16, "rearmed read-only fault");
+    assert.equal(fault.reason, 0x10e);
+    assert.equal(fault.error, 7);
+    assert.equal(jit.full_snapshot().state[60], VIRTUAL_BASE + DATA);
+    assert.equal(jit.full_snapshot().state[11], VIRTUAL_BASE + START + 0x40);
+    assert.equal(jit.physical.getUint32(DATA, true), 0x55667788);
+    assert.deepEqual(jit.full_snapshot().dirty, []);
+    console.log("dirty rearm: cached reads, successive JIT writes, aliases and strict write fault passed");
+}
+
+{
+    const target = START + 0x100;
+    const address = VIRTUAL_BASE + target;
+    const code = [0xa2, address & 255, address >>> 8 & 255, address >>> 16 & 255, address >>> 24,
+        0x40, 0xff, 0xe1];
+    const jit = create_cpu(code, { paging: true });
+    const baseline = baseline_module && create_cpu(code, { paging: true, cpu_module: baseline_module });
+    const cpus = [jit, ...(baseline ? [baseline] : [])];
+    for(const cpu of cpus)
+    {
+        cpu.resume(0x12);
+        cpu.execute(3);
+        cpu.clear_dirty([START]);
+        cpu.resume(0x34);
+    }
+    const writes = jit.counts.jit_slow_writes;
+    const result = jit.execute(4);
+    if(baseline)
+    {
+        assert.deepEqual(result, baseline.execute(4));
+        assert.deepEqual(jit.full_snapshot(), baseline.full_snapshot(), "SMC keeps all 153 words and exact precharge");
+    }
+    assert.equal(result.reason, 1);
+    assert.equal(result.eip, VIRTUAL_BASE + START + 5);
+    assert.equal(jit.full_snapshot().state[11], VIRTUAL_BASE + START);
+    assert.equal(jit.full_snapshot().memory[target], 0x34);
+    assert(jit.counts.jit_slow_writes > writes, "rearmed executable page reaches the compiled SMC helper");
+    assert.deepEqual(jit.full_snapshot().dirty, [VIRTUAL_BASE + START]);
+    console.log("dirty rearm: compiled SMC bail and single interpreted retry passed");
+}
+
+// Full opaque restoration still replaces the address space and every parked
+// thread field; a subsequent partial return must use that restored context.
+{
+    const address = VIRTUAL_BASE + DATA;
+    const code = [0xa1, address & 255, address >>> 8 & 255, address >>> 16 & 255, address >>> 24,
+        0xeb, 0xf9];
+    const jit = create_cpu(code, { paging: true });
+    const baseline = baseline_module && create_cpu(code, { paging: true, cpu_module: baseline_module });
+    const cpus = [jit, ...(baseline ? [baseline] : [])];
+    const parked = [];
+    for(const cpu of cpus)
+    {
+        cpu.physical.setUint32(DATA, 0x66778899, true);
+        cpu.execute(4096);
+        cpu.execute(4096);
+        parked.push(cpu.full_snapshot().state);
+        const memory = new Uint8Array(cpu.physical.buffer, cpu.physical.byteOffset, MEMORY_SIZE);
+        memory.copyWithin(0x12000, PAGE_DIRECTORY, PAGE_DIRECTORY + 4096);
+        memory.copyWithin(0x13000, PAGE_TABLE, PAGE_TABLE + 4096);
+        cpu.physical.setUint32(0x12000 + (VIRTUAL_BASE >>> 22) * 4, 0x13000 | 7, true);
+        cpu.physical.setUint32(0x13000 + (DATA >>> 12) * 4, 0xa000 | 7, true);
+        cpu.physical.setUint32(0xa000, 0x778899aa, true);
+        const state = new Uint32Array(cpu.wasm.memory.buffer, cpu.wasm.vine_cpu_state_ptr(), 153);
+        state[61] = 0x12000;
+        state[5] = 0x12344321;
+        state[38] = 0x4000; // the parked thread's FS base
+        assert.equal(cpu.wasm.vine_cpu_state_restore(), 0);
+        cpu.resume();
+    }
+    const switched = jit.execute(2);
+    if(baseline)
+    {
+        assert.deepEqual(switched, baseline.execute(2));
+        assert.deepEqual(jit.full_snapshot(), baseline.full_snapshot(), "CR3 switch remains fully strict");
+    }
+    assert.equal(switched.registers[0], 0x778899aa, "full restore flushes the previous data translation");
+    assert.equal(switched.registers[3], 0x12344321);
+    for(let index = 0; index < cpus.length; index++)
+    {
+        const cpu = cpus[index];
+        new Uint32Array(cpu.wasm.memory.buffer, cpu.wasm.vine_cpu_state_ptr(), 153).set(parked[index]);
+        assert.equal(cpu.wasm.vine_cpu_state_restore(), 0);
+        assert.deepEqual(cpu.full_snapshot().state, parked[index], "all parked thread words restore exactly");
+        cpu.resume();
+    }
+    const restored = jit.execute(2);
+    if(baseline)
+    {
+        assert.deepEqual(restored, baseline.execute(2));
+        assert.deepEqual(jit.full_snapshot(), baseline.full_snapshot(), "restored parked context remains strict");
+    }
+    assert.equal(restored.registers[0], 0x66778899);
+    console.log("stopped resume: full CR3/thread restoration retains flush and all 153 words passed");
 }
 
 const ordinary = create_cpu(loops[0][1]);

@@ -2322,6 +2322,20 @@ pub unsafe fn full_clear_tlb() {
     };
 }
 
+// The host has cleared this virtual page's PTE dirty bit. Keep its read/code
+// translation, but make its next write walk the PTE and report dirty again.
+#[no_mangle]
+pub unsafe fn vine_rearm_dirty_page(address: u32) -> u32 {
+    if address & 0xFFF != 0 || vine_execution_active {
+        return 1;
+    }
+    let entry = &mut tlb_data[(address >> 12) as usize];
+    if *entry & TLB_VALID != 0 {
+        *entry |= TLB_READONLY;
+    }
+    0
+}
+
 #[no_mangle]
 pub unsafe fn clear_tlb() {
     profiler::stat_increment(stat::CLEAR_TLB);
@@ -3480,6 +3494,30 @@ pub unsafe fn vine_execute_budget(max_instructions: u32) -> u32 {
 
 #[no_mangle]
 pub unsafe fn vine_get_stop_error_code() -> i32 { vine_stop_error_code }
+
+// Same stopped context: the host only completed an API/callback return. Paging,
+// segments, flags and the rest of the architectural state remain unchanged.
+#[no_mangle]
+pub unsafe fn vine_cpu_apply_stopped_resume(
+    eax: u32,
+    write_eax: u32,
+    esp: u32,
+    eip: u32,
+) -> u32 {
+    if write_eax > 1 || vine_execution_active {
+        return 1;
+    }
+    if write_eax != 0 {
+        *reg32 = eax as i32;
+    }
+    *reg32.offset(4) = esp as i32;
+    *instruction_pointer = eip as i32;
+    *previous_ip = eip as i32;
+    *in_hlt = false;
+    *last_virt_eip = -1;
+    *eip_phys = 0;
+    0
+}
 
 #[cold]
 pub unsafe fn trigger_de() {
