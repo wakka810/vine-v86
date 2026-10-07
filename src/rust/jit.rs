@@ -347,6 +347,7 @@ pub struct JitContext<'a> {
     pub current_instruction: Instruction,
     pub previous_instruction: Instruction,
     pub instruction_counter: WasmLocal,
+    pub instruction_limit: Option<WasmLocal>,
     pub wasm_table_index: WasmTableIndex,
 }
 impl<'a> JitContext<'a> {
@@ -465,7 +466,8 @@ fn jit_find_basic_blocks(
         if !pages.contains(&phys_page) {
             // page seen for the first time, handle entry points
             if !target_only {
-                let Some((hotness, entry_points)) = ctx.entry_points.get_mut(&phys_page) else {
+                let Some((hotness, entry_points)) = ctx.entry_points.get_mut(&phys_page)
+                else {
                     // no entry points: ignore this page?
                     page_blacklist.insert(phys_page);
                     return None;
@@ -575,8 +577,7 @@ fn jit_find_basic_blocks(
 
             dbg_assert!(Page::page_of(current_address) == Page::page_of(addr_before_instruction));
             let current_virt_addr = to_visit & !0xFFF | current_address as i32 & 0xFFF;
-            let instruction_virt_addr =
-                to_visit as u32 & !0xFFF | addr_before_instruction & 0xFFF;
+            let instruction_virt_addr = to_visit as u32 & !0xFFF | addr_before_instruction & 0xFFF;
 
             if analysis.ty == AnalysisType::STI && is_near_end_of_page(current_address) {
                 // cut off before the STI so that it is handled by interpreted mode
@@ -1247,6 +1248,17 @@ fn jit_generate_module(
     builder.const_i32(0);
     let instruction_counter = builder.set_new_local();
 
+    // cycle_internal_with_budget sets the limit before this synchronous invocation
+    // and resets it after we return. Dispatch, helpers, and cache invalidation do
+    // not change it, so every block can use the same invocation-local snapshot.
+    let instruction_limit = if unsafe { cpu::vine_jit_exact_instruction_budget } {
+        builder.call_fn0_ret("vine_jit_instruction_limit");
+        Some(builder.set_new_local())
+    }
+    else {
+        None
+    };
+
     let exit_label = builder.block_void();
     let exit_with_fault_label = builder.block_void();
     let main_loop_label = builder.loop_void();
@@ -1276,6 +1288,7 @@ fn jit_generate_module(
         current_instruction: Instruction::Other,
         previous_instruction: Instruction::Other,
         instruction_counter,
+        instruction_limit,
         wasm_table_index,
     };
 
@@ -1433,9 +1446,10 @@ fn jit_generate_module(
                         ctx.builder.const_i32(state_flags.to_u32() as i32);
                         ctx.builder.eq_i32();
                         ctx.builder.get_local(&code);
-                        ctx.builder.load_aligned_u16(
-                            std::mem::offset_of!(cpu::Code, wasm_table_index) as u32,
-                        );
+                        ctx.builder
+                            .load_aligned_u16(
+                                std::mem::offset_of!(cpu::Code, wasm_table_index) as u32
+                            );
                         ctx.builder.const_i32(wasm_table_index.to_u16() as i32);
                         ctx.builder.eq_i32();
                         ctx.builder.and_i32();
@@ -1448,9 +1462,8 @@ fn jit_generate_module(
                         ctx.builder.const_i32(1);
                         ctx.builder.shl_i32();
                         ctx.builder.add_i32();
-                        ctx.builder.load_aligned_u16(
-                            std::mem::offset_of!(cpu::Code, state_table) as u32,
-                        );
+                        ctx.builder
+                            .load_aligned_u16(std::mem::offset_of!(cpu::Code, state_table) as u32);
                         ctx.builder.tee_local(target_block);
                         ctx.builder.const_i32(u16::MAX as i32);
                         ctx.builder.ne_i32();
@@ -2095,6 +2108,9 @@ fn jit_generate_module(
     }
     ctx.builder
         .free_local(ctx.instruction_counter.unsafe_clone());
+    if let Some(local) = ctx.instruction_limit.take() {
+        ctx.builder.free_local(local);
+    }
 
     ctx.builder.finish();
 
@@ -2140,11 +2156,11 @@ fn jit_generate_basic_block(ctx: &mut JitContext, block: &BasicBlock) {
         ctx.builder.call_fn1("enter_basic_block");
     }
 
-    if unsafe { cpu::vine_jit_exact_instruction_budget } {
+    if let Some(limit) = &ctx.instruction_limit {
         ctx.builder.get_local(&ctx.instruction_counter);
         ctx.builder.const_i32(block.number_of_instructions as i32);
         ctx.builder.add_i32();
-        ctx.builder.call_fn0_ret("vine_jit_instruction_limit");
+        ctx.builder.get_local(limit);
         ctx.builder.gtu_i32();
         ctx.builder.if_void();
         codegen::gen_set_eip_low_bits(ctx.builder, block.addr as i32 & 0xFFF);

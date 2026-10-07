@@ -364,6 +364,9 @@ rust-test: $(RUST_FILES)
 rust-test-intensive:
 	QUICKCHECK_TESTS=100000000 make rust-test
 
+vine-jit-budget-test: build/v86-fallback.wasm
+	node tests/api/vine-jit-budget.js
+
 api-tests: build/v86-debug.wasm
 	./tests/api/clean-shutdown.js
 	./tests/api/state.js

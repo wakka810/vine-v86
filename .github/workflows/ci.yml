@@ -54,6 +54,9 @@ jobs:
       - name: Build fallback
         run: make build/v86-fallback.wasm
 
+      - name: Run Vine JIT budget tests
+        run: make vine-jit-budget-test
+
       - name: rustfmt check
         run: make rustfmt
 
