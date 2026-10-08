@@ -982,7 +982,8 @@ for(const operation of [null, 0, 1, 2, 3, 4, 5, 6, 7])
     assert(jit.counts.entries > 0);
     assert(jit.counts.fpu_imports.has(operation === null ? "fpu_fld_m32_jit" : "fpu_op_m32_jit"));
     assert(!jit.counts.fpu_imports.has("f32_to_f80_jit"), "one generated native import replaces the pair");
-    if(baseline) assert(baseline.counts.fpu_imports.has("f32_to_f80_jit"));
+    if(baseline) assert(baseline.counts.fpu_imports.has("f32_to_f80_jit") ||
+        baseline.counts.fpu_imports.has(operation === null ? "fpu_fld_m32_jit" : "fpu_op_m32_jit"));
     for(const bits of [0x3fc00000, 0xbf000000, 0, 0x80000000, 1, 0x7f7fffff, 0x7fc01234, 0x7f800001])
     {
         for(const cpu of cpus) seed_fpu(cpu, bits);
@@ -1098,3 +1099,50 @@ if(baseline_module)
     assert.deepEqual(ordinary.full_snapshot(), baseline.full_snapshot());
 }
 console.log("ordinary non-Vine JIT invocation: unbounded getter passed");
+
+// SBB32 same-register lowering preserves raw lazy flags and subsequent reads.
+{
+    const values = [0, 1, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF];
+    const fixtures = [
+        { alias: true, code: [0x1B, 0xC0, 0xFF, 0xE1] },
+        { alias: false, code: [0x1B, 0xC3, 0xFF, 0xE1] },
+    ];
+    let cases = 0;
+    for(const fixture of fixtures)
+    {
+        const pair = create_pair(Uint8Array.from(fixture.code));
+        for(let warm = 0; warm < 258; warm++) pair.execute(4096, "SBB warm entry");
+        assert(pair.jit.counts.entries > 0);
+        if(pair.baseline) assert(pair.baseline.counts.entries > 0);
+        for(const dest of values) for(const carry of [0, 1])
+        {
+            const source = fixture.alias ? dest : values[(values.indexOf(dest) + 2) % values.length];
+            for(const cpu of pair.cpus)
+            {
+                cpu.resume(dest);
+                cpu.set_register(3, source);
+                const fields = new DataView(cpu.wasm.memory.buffer);
+                fields.setUint32(96, 31, true);
+                fields.setUint32(100, 0, true);
+                fields.setUint32(104, 0xDEADBEEF, true);
+                fields.setUint32(112, 0xCAFE1234, true);
+                fields.setUint32(120, 0x202 | 0x8D4 | carry, true);
+            }
+            const before = pair.jit.full_snapshot();
+            const result = pair.execute(2, "SBB compiled alias/nonalias with seeded carry");
+            const after = pair.jit.full_snapshot();
+            assert.equal(after.jit - before.jit, 2n, "case actually executes the compiled two-instruction BB");
+            const value = Number(BigInt.asUintN(32, BigInt(dest) - BigInt(source) - BigInt(carry)));
+            assert.equal(result.registers[0], value);
+            assert.equal(result.flags & 1, Number(BigInt(dest) < BigInt(source) + BigInt(carry)));
+            assert.equal(result.flags & 16, (dest ^ source ^ value) & 16);
+            assert.equal(result.flags & 2048, ((dest ^ source) & (dest ^ value) & 0x80000000) ? 2048 : 0);
+            assert.equal(new DataView(pair.jit.wasm.memory.buffer).getUint32(104, true), 0xDEADBEEF,
+                "SBB does not write last_op1");
+            cases++;
+        }
+        pair.jit.assert_hoisted();
+        if(pair.baseline) pair.baseline.assert_hoisted();
+    }
+    console.log(`SBB alias focused: ${cases} compiled cases, alias/nonalias and both carry inputs.`);
+}

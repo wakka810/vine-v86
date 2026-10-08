@@ -1325,9 +1325,15 @@ fn gen_sbb8(ctx: &mut JitContext, dest_operand: &WasmLocal, source_operand: &Loc
     };
 }
 fn gen_sbb32(ctx: &mut JitContext, dest_operand: &WasmLocal, source_operand: &LocalOrImmediate) {
-    ctx.builder.get_local(&dest_operand);
-    source_operand.gen_get(ctx.builder);
-    ctx.builder.sub_i32();
+    let same_operand = source_operand.eq_local(dest_operand);
+    if same_operand {
+        ctx.builder.const_i32(0);
+    }
+    else {
+        ctx.builder.get_local(&dest_operand);
+        source_operand.gen_get(ctx.builder);
+        ctx.builder.sub_i32();
+    }
     codegen::gen_getcf(ctx, ConditionNegate::False);
     ctx.builder.sub_i32();
     let res = ctx.builder.set_new_local();
@@ -1347,14 +1353,16 @@ fn gen_sbb32(ctx: &mut JitContext, dest_operand: &WasmLocal, source_operand: &Lo
 
     // cf: (res ^ ((res ^ source_operand) & (source_operand ^ dest_operand))) >> op_size & FLAG_CARRY
     ctx.builder.get_local(&res);
-    ctx.builder.get_local(&res);
-    source_operand.gen_get(ctx.builder);
-    ctx.builder.xor_i32();
-    source_operand.gen_get(ctx.builder);
-    ctx.builder.get_local(&dest_operand);
-    ctx.builder.xor_i32();
-    ctx.builder.and_i32();
-    ctx.builder.xor_i32();
+    if !same_operand {
+        ctx.builder.get_local(&res);
+        source_operand.gen_get(ctx.builder);
+        ctx.builder.xor_i32();
+        source_operand.gen_get(ctx.builder);
+        ctx.builder.get_local(&dest_operand);
+        ctx.builder.xor_i32();
+        ctx.builder.and_i32();
+        ctx.builder.xor_i32();
+    }
     ctx.builder.const_i32(31);
     ctx.builder.shr_u_i32();
     ctx.builder.const_i32(FLAG_CARRY);
@@ -1362,28 +1370,34 @@ fn gen_sbb32(ctx: &mut JitContext, dest_operand: &WasmLocal, source_operand: &Lo
     ctx.builder.or_i32();
 
     // af: (dest_operand ^ source_operand ^ res) & FLAG_ADJUST
-    ctx.builder.get_local(&dest_operand);
-    source_operand.gen_get(ctx.builder);
+    if !same_operand {
+        ctx.builder.get_local(&dest_operand);
+        source_operand.gen_get(ctx.builder);
+    }
     ctx.builder.get_local(&res);
-    ctx.builder.xor_i32();
-    ctx.builder.xor_i32();
+    if !same_operand {
+        ctx.builder.xor_i32();
+        ctx.builder.xor_i32();
+    }
     ctx.builder.const_i32(FLAG_ADJUST);
     ctx.builder.and_i32();
     ctx.builder.or_i32();
 
     // of: ((source_operand ^ dest_operand) & (res ^ dest_operand)) >> op_size << 11 & FLAG_OVERFLOW
-    source_operand.gen_get(ctx.builder);
-    ctx.builder.get_local(&dest_operand);
-    ctx.builder.xor_i32();
-    ctx.builder.get_local(&res);
-    ctx.builder.get_local(&dest_operand);
-    ctx.builder.xor_i32();
-    ctx.builder.and_i32();
-    ctx.builder.const_i32(31 - 11);
-    ctx.builder.shr_u_i32();
-    ctx.builder.const_i32(FLAG_OVERFLOW);
-    ctx.builder.and_i32();
-    ctx.builder.or_i32();
+    if !same_operand {
+        source_operand.gen_get(ctx.builder);
+        ctx.builder.get_local(&dest_operand);
+        ctx.builder.xor_i32();
+        ctx.builder.get_local(&res);
+        ctx.builder.get_local(&dest_operand);
+        ctx.builder.xor_i32();
+        ctx.builder.and_i32();
+        ctx.builder.const_i32(31 - 11);
+        ctx.builder.shr_u_i32();
+        ctx.builder.const_i32(FLAG_OVERFLOW);
+        ctx.builder.and_i32();
+        ctx.builder.or_i32();
+    }
 
     ctx.builder.store_aligned_i32(0);
 
