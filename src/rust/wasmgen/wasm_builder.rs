@@ -54,6 +54,10 @@ enum FunctionType {
     FN3_I32_I64_I32,
     FN3_I32_I64_I32_RET,
     FN4_I32_I64_I64_I32_RET,
+    FN4_I64_I32_I64_I32_RET_I64,
+    FN4_I64_I32_I64_I32,
+    // State index, eight GPRs, cumulative retired instructions and slice limit.
+    FN11,
     // When adding at the end, update LAST below
 }
 
@@ -63,7 +67,7 @@ impl FunctionType {
         unsafe { transmute(x) }
     }
     pub fn to_u8(self: FunctionType) -> u8 { self as u8 }
-    pub const LAST: FunctionType = FunctionType::FN4_I32_I64_I64_I32_RET;
+    pub const LAST: FunctionType = FunctionType::FN11;
 }
 
 pub const WASM_MODULE_ARGUMENT_COUNT: u8 = 1;
@@ -71,6 +75,8 @@ pub const WASM_MODULE_ARGUMENT_COUNT: u8 = 1;
 pub struct WasmBuilder {
     output: Vec<u8>,
     instruction_body: Vec<u8>,
+    chain_entry: Vec<u8>,
+    argument_count: u8,
     imported_call_count: usize,
 
     idx_import_table_size: usize, // for rewriting once finished
@@ -119,6 +125,8 @@ impl WasmBuilder {
         let mut b = WasmBuilder {
             output: Vec::with_capacity(256),
             instruction_body: Vec::with_capacity(256),
+            chain_entry: Vec::new(),
+            argument_count: WASM_MODULE_ARGUMENT_COUNT,
 
             idx_import_table_size: 0,
             idx_import_count: 0,
@@ -164,6 +172,8 @@ impl WasmBuilder {
         self.set_import_table_size(2);
         self.set_import_count(0);
         self.instruction_body.clear();
+        self.chain_entry.clear();
+        self.argument_count = WASM_MODULE_ARGUMENT_COUNT;
         self.imported_call_count = 0;
         self.free_locals_i32.clear();
         self.free_locals_i64.clear();
@@ -179,6 +189,7 @@ impl WasmBuilder {
         dbg_assert!(self.label_stack.is_empty());
 
         self.write_memory_import();
+        if self.is_chained() { self.write_chain_table_import(); }
         self.write_function_section();
         self.write_export_section();
 
@@ -191,7 +202,18 @@ impl WasmBuilder {
         self.output.push(0);
         self.output.push(0);
 
-        self.output.push(1); // number of function bodies: just 1
+        self.output.push(if self.is_chained() { 2 } else { 1 });
+        if self.is_chained() {
+            // f is the CPU dispatcher entry; g carries the same invocation
+            // between modules without spilling GPRs or growing the Wasm stack.
+            let mut wrapper = vec![0]; // No locals in f.
+            wrapper.extend_from_slice(&self.chain_entry);
+            wrapper.push(op::OP_RETURN_CALL);
+            write_leb_u32(&mut wrapper, self.import_count as u32 - 1);
+            wrapper.push(op::OP_END);
+            write_leb_u32(&mut self.output, wrapper.len() as u32);
+            self.output.extend_from_slice(&wrapper);
+        }
 
         // same as above but for body size of the function
         let idx_fn_body_size = self.output.len();
@@ -209,7 +231,7 @@ impl WasmBuilder {
         let free_locals_i64 = &self.free_locals_i64;
 
         let locals = (0..self.local_count).map(|i| {
-            let local_index = WASM_MODULE_ARGUMENT_COUNT + i;
+            let local_index = self.argument_count + i;
             if free_locals_i64.iter().any(|v| v.idx() == local_index) {
                 op::TYPE_I64
             }
@@ -413,6 +435,19 @@ impl WasmBuilder {
                     self.output.push(1);
                     self.output.push(op::TYPE_I32);
                 },
+                FunctionType::FN4_I64_I32_I64_I32_RET_I64 => {
+                    self.output.extend([op::TYPE_FUNC, 4, op::TYPE_I64, op::TYPE_I32,
+                        op::TYPE_I64, op::TYPE_I32, 1, op::TYPE_I64]);
+                },
+                FunctionType::FN4_I64_I32_I64_I32 => {
+                    self.output.extend([op::TYPE_FUNC, 4, op::TYPE_I64, op::TYPE_I32,
+                        op::TYPE_I64, op::TYPE_I32, 0]);
+                },
+                FunctionType::FN11 => {
+                    self.output.extend([op::TYPE_FUNC, 11]);
+                    self.output.extend([op::TYPE_I32; 11]);
+                    self.output.push(0);
+                },
             }
         }
 
@@ -490,6 +525,15 @@ impl WasmBuilder {
         self.set_import_table_size(new_table_size);
     }
 
+    fn write_chain_table_import(&mut self) {
+        let before = self.output.len();
+        self.output.extend([1, b'e', 1, b't', op::EXT_TABLE, op::TYPE_ANYFUNC, 0]);
+        write_leb_u32(&mut self.output,
+            crate::cpu::cpu::WASM_TABLE_OFFSET + 2 * crate::jit::WASM_TABLE_SIZE);
+        self.set_import_count(self.import_count + 1);
+        self.set_import_table_size(self.import_table_size + self.output.len() - before);
+    }
+
     fn write_import_entry(&mut self, fn_name: &str, type_index: FunctionType) -> u16 {
         self.output.push(1); // length of module name
         self.output.push('e' as u8); // module name
@@ -509,15 +553,16 @@ impl WasmBuilder {
 
     pub fn write_function_section(&mut self) {
         self.output.push(op::SC_FUNCTION);
-        self.output.push(2); // length of this section
-        self.output.push(1); // count of signature indices
+        self.output.push(if self.is_chained() { 3 } else { 2 });
+        self.output.push(if self.is_chained() { 2 } else { 1 });
         self.output.push(FunctionType::FN1.to_u8());
+        if self.is_chained() { self.output.push(FunctionType::FN11.to_u8()); }
     }
 
     pub fn write_export_section(&mut self) {
         self.output.push(op::SC_EXPORT);
-        self.output.push(1 + 1 + 1 + 1 + 2); // size of this section
-        self.output.push(1); // count of table: just one function exported
+        self.output.push(if self.is_chained() { 11 } else { 6 });
+        self.output.push(if self.is_chained() { 2 } else { 1 });
 
         self.output.push(1); // length of exported function name
         self.output.push('f' as u8); // function name
@@ -529,7 +574,31 @@ impl WasmBuilder {
         let next_op_idx = self.output.len();
         self.output.push(0);
         self.output.push(0); // add 2 bytes for writing 16 byte val
-        write_fixed_leb16_at_idx(&mut self.output, next_op_idx, self.import_count - 1);
+        let function_imports = self.import_count - if self.is_chained() { 2 } else { 1 };
+        write_fixed_leb16_at_idx(&mut self.output, next_op_idx, function_imports);
+        if self.is_chained() {
+            self.output.extend([1, b'g', op::EXT_FUNCTION, 0, 0]);
+            let index = self.output.len() - 2;
+            write_fixed_leb16_at_idx(&mut self.output, index, function_imports + 1);
+        }
+    }
+
+    pub fn prepare_chain_entry(&mut self) {
+        dbg_assert!(self.local_count == 0 && self.label_stack.is_empty());
+        self.chain_entry = std::mem::take(&mut self.instruction_body);
+        self.argument_count = 11;
+    }
+
+    pub fn is_chained(&self) -> bool { self.argument_count == 11 }
+
+    pub fn get_argument(&mut self, index: u8) {
+        dbg_assert!(index < self.argument_count);
+        self.instruction_body.extend([op::OP_GETLOCAL, index]);
+    }
+
+    pub fn return_call_chain(&mut self) {
+        dbg_assert!(self.is_chained());
+        self.instruction_body.extend([op::OP_RETURN_CALLINDIRECT, FunctionType::FN11.to_u8(), 0]);
     }
 
     fn get_fn_idx(&mut self, fn_name: &str, type_index: FunctionType) -> u16 {
@@ -564,15 +633,20 @@ impl WasmBuilder {
         match self.free_locals_i32.pop() {
             Some(local) => local,
             None => {
-                let new_idx = self.local_count + WASM_MODULE_ARGUMENT_COUNT;
+                let new_idx = self.local_count + self.argument_count;
                 self.local_count = self.local_count.checked_add(1).unwrap();
                 WasmLocal(new_idx)
             },
         }
     }
+    pub fn can_allocate_temporary_locals(&self, additional: u8) -> bool {
+        // Local indices currently use a single-byte LEB encoding.
+        self.local_count as usize + self.argument_count as usize
+            + additional as usize <= 128
+    }
     pub fn free_local(&mut self, local: WasmLocal) {
         dbg_assert!(
-            (WASM_MODULE_ARGUMENT_COUNT..self.local_count + WASM_MODULE_ARGUMENT_COUNT)
+            (self.argument_count..self.local_count + self.argument_count)
                 .contains(&local.0)
         );
         self.free_locals_i32.push(local)
@@ -610,7 +684,7 @@ impl WasmBuilder {
         match self.free_locals_i64.pop() {
             Some(local) => local,
             None => {
-                let new_idx = self.local_count + WASM_MODULE_ARGUMENT_COUNT;
+                let new_idx = self.local_count + self.argument_count;
                 self.local_count += 1;
                 WasmLocalI64(new_idx)
             },
@@ -618,7 +692,7 @@ impl WasmBuilder {
     }
     pub fn free_local_i64(&mut self, local: WasmLocalI64) {
         dbg_assert!(
-            (WASM_MODULE_ARGUMENT_COUNT..self.local_count + WASM_MODULE_ARGUMENT_COUNT)
+            (self.argument_count..self.local_count + self.argument_count)
                 .contains(&local.0)
         );
         self.free_locals_i64.push(local)
@@ -639,6 +713,10 @@ impl WasmBuilder {
     }
     pub fn get_local_i64(&mut self, local: &WasmLocalI64) {
         self.instruction_body.push(op::OP_GETLOCAL);
+        self.instruction_body.push(local.idx());
+    }
+    pub fn set_local_i64(&mut self, local: &WasmLocalI64) {
+        self.instruction_body.push(op::OP_SETLOCAL);
         self.instruction_body.push(local.idx());
     }
 
@@ -803,11 +881,22 @@ impl WasmBuilder {
 
     pub fn add_i32(&mut self) { self.instruction_body.push(op::OP_I32ADD); }
     pub fn add_i64(&mut self) { self.instruction_body.push(op::OP_I64ADD); }
+    pub fn add_f64(&mut self) { self.instruction_body.push(op::OP_F64ADD); }
+    pub fn sub_f64(&mut self) { self.instruction_body.push(op::OP_F64SUB); }
+    pub fn mul_f64(&mut self) { self.instruction_body.push(op::OP_F64MUL); }
+    pub fn nearest_f64(&mut self) { self.instruction_body.push(op::OP_F64NEAREST); }
+    pub fn trunc_f64(&mut self) { self.instruction_body.push(op::OP_F64TRUNC); }
+    pub fn lt_f64(&mut self) { self.instruction_body.push(op::OP_F64LT); }
+    pub fn eq_f64(&mut self) { self.instruction_body.push(op::OP_F64EQ); }
+    pub fn ge_f64(&mut self) { self.instruction_body.push(op::OP_F64GE); }
+    pub fn trunc_signed_f64_to_i32(&mut self) { self.instruction_body.push(op::OP_I32TRUNCSF64); }
     pub fn sub_i32(&mut self) { self.instruction_body.push(op::OP_I32SUB); }
     pub fn and_i32(&mut self) { self.instruction_body.push(op::OP_I32AND); }
     pub fn or_i32(&mut self) { self.instruction_body.push(op::OP_I32OR); }
     pub fn or_i64(&mut self) { self.instruction_body.push(op::OP_I64OR); }
+    pub fn and_i64(&mut self) { self.instruction_body.push(op::OP_I64AND); }
     pub fn xor_i32(&mut self) { self.instruction_body.push(op::OP_I32XOR); }
+    pub fn xor_i64(&mut self) { self.instruction_body.push(op::OP_I64XOR); }
     pub fn mul_i32(&mut self) { self.instruction_body.push(op::OP_I32MUL); }
     pub fn mul_i64(&mut self) { self.instruction_body.push(op::OP_I64MUL); }
     pub fn div_i64(&mut self) { self.instruction_body.push(op::OP_I64DIVU); }
@@ -827,6 +916,12 @@ impl WasmBuilder {
         self.instruction_body.extend(bytes);
     }
     pub fn bitselect_v128(&mut self) { self.simd(op::SIMD_V128_BITSELECT); }
+    pub fn splat_i64x2(&mut self) { self.simd(op::SIMD_I64X2_SPLAT); }
+    pub fn extract_i64x2_lane(&mut self, lane: u8) {
+        dbg_assert!(lane < 2);
+        self.simd(op::SIMD_I64X2_EXTRACT_LANE);
+        self.instruction_body.push(lane);
+    }
     pub fn lt_f32x4(&mut self) { self.simd(op::SIMD_F32X4_LT); }
     pub fn trunc_sat_f32x4_s(&mut self) { self.simd(op::SIMD_I32X4_TRUNC_SAT_F32X4_S); }
     pub fn i8x16_narrow_i16x8_u(&mut self) { self.simd(op::SIMD_I8X16_NARROW_I16X8_U); }
@@ -868,17 +963,17 @@ impl WasmBuilder {
     pub fn reinterpret_i32_as_f32(&mut self) {
         self.instruction_body.push(op::OP_F32REINTERPRETI32);
     }
-    //pub fn reinterpret_f32_as_i32(&mut self) {
-    //    self.instruction_body.push(op::OP_I32REINTERPRETF32);
-    //}
+    pub fn reinterpret_f32_as_i32(&mut self) {
+        self.instruction_body.push(op::OP_I32REINTERPRETF32);
+    }
     pub fn reinterpret_i64_as_f64(&mut self) {
         self.instruction_body.push(op::OP_F64REINTERPRETI64);
     }
-    //pub fn reinterpret_f64_as_i64(&mut self) {
-    //    self.instruction_body.push(op::OP_I64REINTERPRETF64);
-    //}
-    //pub fn promote_f32_to_f64(&mut self) { self.instruction_body.push(op::OP_F64PROMOTEF32); }
-    //pub fn demote_f64_to_f32(&mut self) { self.instruction_body.push(op::OP_F32DEMOTEF64); }
+    pub fn reinterpret_f64_as_i64(&mut self) {
+        self.instruction_body.push(op::OP_I64REINTERPRETF64);
+    }
+    pub fn promote_f32_to_f64(&mut self) { self.instruction_body.push(op::OP_F64PROMOTEF32); }
+    pub fn demote_f64_to_f32(&mut self) { self.instruction_body.push(op::OP_F32DEMOTEF64); }
     //pub fn convert_i32_to_f64(&mut self) { self.instruction_body.push(op::OP_F64CONVERTSI32); }
     //pub fn convert_i64_to_f64(&mut self) { self.instruction_body.push(op::OP_F64CONVERTSI64); }
     pub fn extend_unsigned_i32_to_i64(&mut self) {
@@ -1013,6 +1108,12 @@ impl WasmBuilder {
     }
     pub fn call_fn4_i32_i64_i64_i32_ret(&mut self, name: &str) {
         self.call_fn(name, FunctionType::FN4_I32_I64_I64_I32_RET)
+    }
+    pub fn call_fn4_i64_i32_i64_i32_ret_i64(&mut self, name: &str) {
+        self.call_fn(name, FunctionType::FN4_I64_I32_I64_I32_RET_I64)
+    }
+    pub fn call_fn4_i64_i32_i64_i32(&mut self, name: &str) {
+        self.call_fn(name, FunctionType::FN4_I64_I32_I64_I32)
     }
 
     pub fn unreachable(&mut self) { self.instruction_body.push(op::OP_UNREACHABLE) }

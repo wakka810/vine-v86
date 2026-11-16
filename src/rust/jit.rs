@@ -61,6 +61,22 @@ pub fn jit_clear_func(wasm_table_index: WasmTableIndex) {
 
 static mut JIT_DISABLED: bool = false;
 static mut JIT_SYNCHRONOUS_FINALIZE: bool = false;
+static mut VINE_JIT_CHAINING: bool = false;
+
+#[no_mangle]
+pub unsafe fn vine_get_jit_chaining() -> u32 { VINE_JIT_CHAINING as u32 }
+
+#[no_mangle]
+pub unsafe fn vine_set_jit_chaining(enabled: u32) -> u32 {
+    if enabled > 1 || cpu::vine_execution_is_active() { return 1; }
+    if VINE_JIT_CHAINING != (enabled != 0) {
+        // Every cached target must have the same native entry ABI. This also
+        // cancels a compilation whose old-format finalizer is still queued.
+        jit_clear_cache_js();
+        VINE_JIT_CHAINING = enabled != 0;
+    }
+    0
+}
 
 // Maximum number of pages per wasm module. Necessary for the following reasons:
 // - There is an upper limit on the size of a single function in wasm (currently ~7MB in all browsers)
@@ -123,7 +139,7 @@ struct PageInfo {
 }
 
 enum CompilingPageState {
-    Compiling { pages: HashMap<Page, PageInfo> },
+    Compiling { pages: HashMap<Page, PageInfo>, copied_pages: HashSet<Page> },
     CompilingWritten,
 }
 
@@ -148,7 +164,7 @@ fn check_jit_state_invariants(ctx: &mut JitState) {
     }
 
     match &ctx.compiling {
-        Some((_, CompilingPageState::Compiling { pages })) => {
+        Some((_, CompilingPageState::Compiling { pages, .. })) => {
             dbg_assert!(pages.keys().all(|page| ctx.entry_points.contains_key(page)));
         },
         _ => {},
@@ -184,7 +200,7 @@ fn check_jit_state_invariants(ctx: &mut JitState) {
     }
 
     match &ctx.compiling {
-        Some((_, CompilingPageState::Compiling { pages })) => {
+        Some((_, CompilingPageState::Compiling { pages, .. })) => {
             dbg_assert!(pages.keys().all(|page| ctx.entry_points.contains_key(page)));
         },
         _ => {},
@@ -434,7 +450,30 @@ fn jit_find_basic_blocks(
     ctx: &mut JitState,
     entry_points: HashSet<i32>,
     cpu: CpuContext,
-) -> Vec<BasicBlock> {
+) -> (Vec<BasicBlock>, HashSet<Page>) {
+    // Copy only a short straight-line callee. The source page keeps its public
+    // entry map; this module depends on its bytes without taking it over.
+    fn short_leaf(phys_target: u32, cpu: &CpuContext) -> bool {
+        if !cpu.state_flags.is_32() { return false; }
+        let mut leaf = CpuContext { eip: phys_target, ..cpu.clone() };
+        for _ in 0..16 {
+            if is_near_end_of_page(leaf.eip) || leaf.eip - phys_target >= 128 {
+                return false;
+            }
+            let opcode = memory::read8(leaf.eip);
+            let analysis = analysis::analyze_step(&mut leaf);
+            if (opcode == 0xC3 || opcode == 0xC2)
+                && analysis.ty == AnalysisType::BlockBoundary && analysis.absolute_jump
+            {
+                return true;
+            }
+            if analysis.ty != AnalysisType::Normal || analysis.no_next_instruction {
+                return false;
+            }
+        }
+        false
+    }
+
     fn follow_jump(
         virt_target: i32,
         target_only: bool,
@@ -444,6 +483,8 @@ fn jit_find_basic_blocks(
         max_pages: u32,
         marked_as_entry: &mut HashSet<i32>,
         to_visit_stack: &mut Vec<i32>,
+        copied_pages: &mut HashSet<Page>,
+        cpu: &CpuContext,
     ) -> Option<u32> {
         if is_near_end_of_page(virt_target as u32) {
             return None;
@@ -464,44 +505,49 @@ fn jit_find_basic_blocks(
             return None;
         }
 
-        if !pages.contains(&phys_page) {
-            // page seen for the first time, handle entry points
-            if !target_only {
-                let Some((hotness, entry_points)) = ctx.entry_points.get_mut(&phys_page)
-                else {
-                    // no entry points: ignore this page?
-                    page_blacklist.insert(phys_page);
-                    return None;
-                };
-                let existing_entry_points = match ctx.pages.get(&phys_page) {
-                    Some(PageInfo { entry_points, .. }) => {
-                        HashSet::from_iter(entry_points.iter().map(|x| x.0))
-                    },
-                    None => HashSet::new(),
-                };
+        if copied_pages.contains(&phys_page) {
+            if !target_only || !short_leaf(phys_target, cpu) { return None; }
+            to_visit_stack.push(virt_target);
+            return Some(phys_target);
+        }
 
-                if entry_points
-                    .iter()
-                    .all(|entry_point| existing_entry_points.contains(entry_point))
+        if !pages.contains(&phys_page) {
+            if target_only && ctx.pages.contains_key(&phys_page) {
+                if !short_leaf(phys_target, cpu) { return None; }
+                pages.insert(phys_page);
+                copied_pages.insert(phys_page);
+                to_visit_stack.push(virt_target);
+                return Some(phys_target);
+            }
+            // Installing a module replaces the whole page's entry map, even
+            // when this page was reached only through a direct CALL. Preserve
+            // both observed and previously compiled entries so folding one
+            // callee cannot send the page's other warm entries to interpretation.
+            let mut required_entries: HashSet<u16> = match ctx.pages.get(&phys_page) {
+                Some(PageInfo { entry_points, .. }) => {
+                    HashSet::from_iter(entry_points.iter().map(|x| x.0))
+                },
+                None => HashSet::new(),
+            };
+            if let Some((hotness, entry_points)) = ctx.entry_points.get_mut(&phys_page) {
+                if !target_only
+                    && entry_points.iter().all(|entry| required_entries.contains(entry))
                 {
                     page_blacklist.insert(phys_page);
                     return None;
                 }
-
-                // XXX: Remove this paragraph
-                //let old_length = entry_points.len();
-                //entry_points.extend(existing_entry_points);
-                //dbg_assert!(
-                //    entry_points.union(&existing_entry_points).count() == entry_points.len()
-                //);
-
                 *hotness = 0;
+                required_entries.extend(entry_points.iter().copied());
+            }
+            else if !target_only {
+                page_blacklist.insert(phys_page);
+                return None;
+            }
 
-                for &addr_low in entry_points.iter() {
-                    let addr = virt_target & !0xFFF | addr_low as i32;
-                    to_visit_stack.push(addr);
-                    marked_as_entry.insert(addr);
-                }
+            for addr_low in required_entries {
+                let addr = virt_target & !0xFFF | addr_low as i32;
+                to_visit_stack.push(addr);
+                marked_as_entry.insert(addr);
             }
 
             pages.insert(phys_page);
@@ -517,6 +563,7 @@ fn jit_find_basic_blocks(
     let mut basic_blocks: BTreeMap<u32, BasicBlock> = BTreeMap::new();
     let mut pages: HashSet<Page> = HashSet::new();
     let mut page_blacklist = HashSet::new();
+    let mut copied_pages = HashSet::new();
 
     // 16-bit doesn't work correctly, most likely due to instruction pointer wrap-around
     let max_pages = if cpu.state_flags.is_32() { unsafe { MAX_PAGES } } else { 1 };
@@ -531,6 +578,8 @@ fn jit_find_basic_blocks(
             max_pages,
             &mut marked_as_entry,
             &mut to_visit_stack,
+            &mut copied_pages,
+            &cpu,
         );
         dbg_assert!(ok.is_some());
         dbg_assert!(marked_as_entry.contains(&virt_addr));
@@ -670,6 +719,8 @@ fn jit_find_basic_blocks(
                             max_pages,
                             &mut marked_as_entry,
                             &mut to_visit_stack,
+                            &mut copied_pages,
+                            &cpu,
                         ),
                         condition,
                         jump_offset: offset,
@@ -716,6 +767,8 @@ fn jit_find_basic_blocks(
                             max_pages,
                             &mut marked_as_entry,
                             &mut to_visit_stack,
+                            &mut copied_pages,
+                            &cpu,
                         ),
                         jump_offset: offset,
                         jump_offset_is_32: is_32,
@@ -837,7 +890,7 @@ fn jit_find_basic_blocks(
         }
     }
 
-    basic_blocks
+    (basic_blocks, copied_pages)
 }
 
 #[no_mangle]
@@ -915,7 +968,7 @@ fn jit_analyze_and_generate(
         .iter()
         .map(|e| virt_page.to_address() as i32 | *e as i32)
         .collect();
-    let basic_blocks = jit_find_basic_blocks(ctx, entry_points, cpu.clone());
+    let (basic_blocks, mut copied_pages) = jit_find_basic_blocks(ctx, entry_points, cpu.clone());
 
     let mut pages = HashSet::new();
 
@@ -924,6 +977,7 @@ fn jit_analyze_and_generate(
         dbg_assert!(Page::page_of(b.addr) == Page::page_of(b.end_addr));
         pages.insert(Page::page_of(b.addr));
     }
+    copied_pages.retain(|p| pages.contains(p));
 
     let print = false;
 
@@ -1074,7 +1128,7 @@ fn jit_analyze_and_generate(
     dbg_assert!(ctx.compiling.is_none());
     ctx.compiling = Some((
         wasm_table_index,
-        CompilingPageState::Compiling { pages: page_info },
+        CompilingPageState::Compiling { pages: page_info, copied_pages },
     ));
 
     let phys_addr = page.to_address();
@@ -1106,7 +1160,7 @@ pub fn codegen_finalize_finished(
         Page::page_of(phys_addr).to_address()
     );
 
-    let pages = match mem::replace(&mut ctx.compiling, None) {
+    let (pages, copied_pages) = match mem::replace(&mut ctx.compiling, None) {
         None => {
             dbg_assert!(false);
             return;
@@ -1119,10 +1173,10 @@ pub fn codegen_finalize_finished(
             check_jit_state_invariants(&mut ctx);
             return;
         },
-        Some((in_progress_wasm_table_index, CompilingPageState::Compiling { pages })) => {
+        Some((in_progress_wasm_table_index, CompilingPageState::Compiling { pages, copied_pages })) => {
             dbg_assert!(wasm_table_index == in_progress_wasm_table_index);
             dbg_assert!(!pages.is_empty());
-            pages
+            (pages, copied_pages)
         },
     };
 
@@ -1134,6 +1188,7 @@ pub fn codegen_finalize_finished(
                 (entry as u32 >> 12 ^ page as u32) - (unsafe { memory::mem8 } as u32 >> 12),
             );
             if let Some(info) = pages.get(&tlb_physical_page) {
+                if copied_pages.contains(&tlb_physical_page) { continue; }
                 set_tlb_code(
                     Page::of_u32(page as u32),
                     wasm_table_index,
@@ -1153,6 +1208,19 @@ pub fn codegen_finalize_finished(
     let mut check_for_unused_wasm_table_index = HashSet::new();
 
     for (page, mut info) in pages {
+        if copied_pages.contains(&page) {
+            if let Some(existing) = ctx.pages.get_mut(&page) {
+                existing.hidden_wasm_table_indices.push(wasm_table_index);
+            }
+            else {
+                // Another page may have invalidated the previous callee module
+                // while finalization was pending. Retain this byte dependency
+                // without publishing any of the copied entries.
+                info.entry_points.clear();
+                ctx.pages.insert(page, info);
+            }
+            continue;
+        }
         if let Some(old_entry) = ctx.pages.remove(&page) {
             info.hidden_wasm_table_indices
                 .extend(old_entry.hidden_wasm_table_indices);
@@ -1239,22 +1307,50 @@ fn jit_generate_module(
 ) -> Vec<(u32, u16)> {
     builder.reset();
 
+    if unsafe { VINE_JIT_CHAINING } {
+        builder.get_argument(0);
+        for i in 0..8 { builder.load_fixed_i32(global_pointers::get_reg32_offset(i)); }
+        builder.const_i32(0);
+        if unsafe { cpu::vine_jit_exact_instruction_budget } {
+            builder.call_fn0_ret("vine_jit_instruction_limit");
+        }
+        else { builder.const_i32(-1); }
+        builder.prepare_chain_entry();
+    }
+
     let mut register_locals = (0..8)
         .map(|i| {
-            builder.load_fixed_i32(global_pointers::get_reg32_offset(i));
+            if builder.is_chained() { builder.get_argument(i as u8 + 1); }
+            else { builder.load_fixed_i32(global_pointers::get_reg32_offset(i)); }
             builder.set_new_local()
         })
         .collect();
 
-    builder.const_i32(0);
+    if builder.is_chained() { builder.get_argument(9); }
+    else { builder.const_i32(0); }
     let instruction_counter = builder.set_new_local();
 
     // cycle_internal_with_budget sets the limit before this synchronous invocation
     // and resets it after we return. Dispatch, helpers, and cache invalidation do
     // not change it, so every block can use the same invocation-local snapshot.
     let instruction_limit = if unsafe { cpu::vine_jit_exact_instruction_budget } {
-        builder.call_fn0_ret("vine_jit_instruction_limit");
-        Some(builder.set_new_local())
+        if builder.is_chained() { builder.get_argument(10); }
+        else { builder.call_fn0_ret("vine_jit_instruction_limit"); }
+        let limit = builder.set_new_local();
+        if unsafe { JIT_USE_LOOP_SAFETY } {
+            // Every block already checks its entire charge against this limit.
+            // Bound it once per module entry instead of testing a second limit
+            // on every loop iteration. Clamp chained and non-Vine entries too:
+            // their incoming limit can be unbounded or come from coarse code.
+            builder.get_local(&limit);
+            builder.const_i32(cpu::LOOP_COUNTER);
+            builder.get_local(&limit);
+            builder.const_i32(cpu::LOOP_COUNTER);
+            builder.ltu_i32();
+            builder.select();
+            builder.set_local(&limit);
+        }
+        Some(limit)
     }
     else {
         None
@@ -1263,7 +1359,7 @@ fn jit_generate_module(
     let exit_label = builder.block_void();
     let exit_with_fault_label = builder.block_void();
     let main_loop_label = builder.loop_void();
-    if unsafe { JIT_USE_LOOP_SAFETY } {
+    if instruction_limit.is_none() && unsafe { JIT_USE_LOOP_SAFETY } {
         builder.get_local(&instruction_counter);
         builder.const_i32(cpu::LOOP_COUNTER);
         builder.geu_i32();
@@ -1336,6 +1432,24 @@ fn jit_generate_module(
     }
 
     let mut label_for_addr: HashMap<u32, (Label, Option<u16>)> = HashMap::new();
+
+    // A copied straight-line leaf already has its caller continuation in this
+    // module. Specialize at most two such returns, without discovering any new
+    // blocks or widening the CFG. An unexpected stack return keeps the original
+    // lookup. The ordinary page-switch guard still validates the live mapping.
+    let mut leaf_returns: HashMap<u32, Vec<(i32, u32, u16)>> = HashMap::new();
+    if ctx.cpu.state_flags.is_32() {
+        for caller in basic_blocks.values() {
+            if memory::read8(caller.last_instruction_addr) != 0xe8 { continue; }
+            let BasicBlockType::Normal { next_block_addr: Some(target), jump_offset_is_32: true, .. } = caller.ty else { continue; };
+            let Some(leaf) = basic_blocks.get(&target) else { continue; };
+            if !matches!(leaf.ty, BasicBlockType::AbsoluteEip) || leaf.number_of_instructions > 16
+                || !matches!(memory::read8(leaf.last_instruction_addr), 0xc2 | 0xc3)
+                || !entry_blocks.contains(&caller.end_addr) { continue; }
+            let address = caller.virt_addr & !0xfff | caller.end_addr as i32 & 0xfff;
+            leaf_returns.entry(leaf.addr).or_default().push((address, caller.end_addr, index_for_addr[&caller.end_addr]));
+        }
+    }
 
     enum Work {
         WasmStructure(WasmStructure),
@@ -1428,6 +1542,15 @@ fn jit_generate_module(
                         ctx.builder.br(ctx.exit_label);
                     },
                     BasicBlockType::AbsoluteEip => {
+                        if let Some(returns) = leaf_returns.get(&block.addr).filter(|r| r.len() <= 2) {
+                            for &(address, physical, index) in returns {
+                                codegen::gen_get_eip(ctx.builder);
+                                ctx.builder.const_i32(address); ctx.builder.eq_i32(); ctx.builder.if_void();
+                                codegen::gen_page_switch_check(ctx, physical, block.last_instruction_addr);
+                                ctx.builder.const_i32(index as i32); ctx.builder.set_local(target_block);
+                                ctx.builder.br(main_loop_label); ctx.builder.block_end();
+                            }
+                        }
                         // Check if we can stay in this module, if not exit
                         codegen::gen_profiler_stat_increment(ctx.builder, stat::INDIRECT_JUMP);
                         codegen::gen_get_eip(ctx.builder);
@@ -1481,6 +1604,7 @@ fn jit_generate_module(
                         );
 
                         codegen::gen_debug_track_jit_exit(ctx.builder, block.last_instruction_addr);
+                        gen_chain_to_cached_entry(ctx, state_flags);
                         ctx.builder.br(ctx.exit_label);
                     },
                     &BasicBlockType::Normal {
@@ -1505,6 +1629,7 @@ fn jit_generate_module(
 
                         codegen::gen_debug_track_jit_exit(ctx.builder, block.last_instruction_addr);
                         codegen::gen_profiler_stat_increment(ctx.builder, stat::DIRECT_EXIT);
+                        gen_chain_to_cached_entry(ctx, state_flags);
                         ctx.builder.br(ctx.exit_label);
                     },
                     &BasicBlockType::Normal {
@@ -1809,6 +1934,7 @@ fn jit_generate_module(
                                     ctx.builder,
                                     stat::CONDITIONAL_JUMP_EXIT,
                                 );
+                                gen_chain_to_cached_entry(ctx, state_flags);
                                 ctx.builder.br(ctx.exit_label);
 
                                 if is_first {
@@ -1979,7 +2105,7 @@ fn jit_generate_module(
                     codegen::gen_set_eip_low_bits(ctx.builder, addr as i32 & 0xFFF);
                     profiler::stat_increment(stat::COMPILE_WITH_LOOP_SAFETY);
                     codegen::gen_profiler_stat_increment(ctx.builder, stat::LOOP_SAFETY);
-                    if unsafe { JIT_USE_LOOP_SAFETY } {
+                    if ctx.instruction_limit.is_none() && unsafe { JIT_USE_LOOP_SAFETY } {
                         ctx.builder.get_local(&ctx.instruction_counter);
                         ctx.builder.const_i32(cpu::LOOP_COUNTER);
                         ctx.builder.geu_i32();
@@ -2138,6 +2264,55 @@ fn jit_generate_module(
     return entries;
 }
 
+fn gen_chain_to_cached_entry(ctx: &mut JitContext, state_flags: CachedStateFlags) {
+    if !ctx.builder.is_chained() { return; }
+    // No page walk or fallible helper is allowed between resolving this live
+    // TLB code identity and jumping to it. Misses retain the CPU dispatcher.
+    let fallback = ctx.builder.block_void();
+    codegen::gen_get_eip(ctx.builder);
+    let address = ctx.builder.tee_new_local();
+    ctx.builder.const_i32(12);
+    ctx.builder.shr_u_i32();
+    ctx.builder.const_i32(2);
+    ctx.builder.shl_i32();
+    ctx.builder.load_aligned_i32((&raw const cpu::tlb_code) as u32);
+    let code = ctx.builder.tee_new_local();
+    ctx.builder.eqz_i32();
+    ctx.builder.br_if(fallback);
+    ctx.builder.get_local(&code);
+    ctx.builder.load_u8(std::mem::offset_of!(cpu::Code, state_flags) as u32);
+    ctx.builder.const_i32(state_flags.to_u32() as i32);
+    ctx.builder.ne_i32();
+    ctx.builder.br_if(fallback);
+    ctx.builder.get_local(&code);
+    ctx.builder.get_local(&address);
+    ctx.builder.const_i32(0xFFF);
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(1);
+    ctx.builder.shl_i32();
+    ctx.builder.add_i32();
+    ctx.builder.load_aligned_u16(std::mem::offset_of!(cpu::Code, state_table) as u32);
+    let state = ctx.builder.tee_new_local();
+    ctx.builder.const_i32(u16::MAX as i32);
+    ctx.builder.eq_i32();
+    ctx.builder.br_if(fallback);
+
+    ctx.builder.get_local(&state);
+    for register in ctx.register_locals.iter() { ctx.builder.get_local(register); }
+    ctx.builder.get_local(&ctx.instruction_counter);
+    if let Some(limit) = &ctx.instruction_limit { ctx.builder.get_local(limit); }
+    else { ctx.builder.const_i32(-1); }
+    ctx.builder.get_local(&code);
+    ctx.builder.load_aligned_u16(std::mem::offset_of!(cpu::Code, wasm_table_index) as u32);
+    ctx.builder.const_i32((cpu::WASM_TABLE_OFFSET + WASM_TABLE_SIZE) as i32);
+    ctx.builder.add_i32();
+    ctx.builder.return_call_chain();
+    ctx.builder.block_end();
+    ctx.builder.free_local(state);
+    ctx.builder.free_local(code);
+    ctx.builder.free_local(address);
+}
+
 fn jit_generate_basic_block(ctx: &mut JitContext, block: &BasicBlock) {
     let needs_eip_updated = match block.ty {
         BasicBlockType::Exit => true,
@@ -2181,6 +2356,14 @@ fn jit_generate_basic_block(ctx: &mut JitContext, block: &BasicBlock) {
     ctx.mmx_task_switch_call_count = None;
 
     loop {
+        if crate::jit_fast_x87::generate(ctx, block) {
+            if ctx.cpu.eip == stop_addr { break; }
+            continue;
+        }
+        if crate::jit_fast_memory::generate(ctx, block) {
+            if ctx.cpu.eip == stop_addr { break; }
+            continue;
+        }
         let mut instruction = 0;
         if cfg!(feature = "profiler") {
             instruction = memory::read32s(ctx.cpu.eip) as u32;
@@ -2420,7 +2603,7 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
             did_have_code = true;
 
             match &ctx.compiling {
-                Some((index, CompilingPageState::Compiling { pages })) => {
+                Some((index, CompilingPageState::Compiling { pages, .. })) => {
                     if pages.contains_key(&page) {
                         ctx.compiling = Some((*index, CompilingPageState::CompilingWritten));
                     }
@@ -2431,7 +2614,7 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
     }
 
     match &ctx.compiling {
-        Some((_, CompilingPageState::Compiling { pages })) => {
+        Some((_, CompilingPageState::Compiling { pages, .. })) => {
             dbg_assert!(!pages.contains_key(&page));
         },
         _ => {},

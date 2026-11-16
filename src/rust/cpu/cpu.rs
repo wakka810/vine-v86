@@ -302,6 +302,7 @@ const VINE_STOP_EXCEPTION_BASE: u32 = 0x100;
 const VINE_JIT_MIN_BUDGET: u32 = 4096;
 
 static mut vine_execution_active: bool = false;
+pub unsafe fn vine_execution_is_active() -> bool { vine_execution_active }
 static mut vine_validated_execute_page: u32 = u32::MAX;
 static mut vine_stop_reason: u32 = 0;
 static mut vine_stop_error_code: i32 = -1;
@@ -2557,7 +2558,7 @@ pub unsafe fn read_imm8() -> OrPageFault<i32> {
         *last_virt_eip = eip & !0xFFF
     }
     dbg_assert!(!memory::in_mapped_range((*eip_phys ^ eip) as u32));
-    let data8 = *memory::mem8.offset((*eip_phys ^ eip) as isize) as i32;
+    let data8 = *memory::mem8.wrapping_add((*eip_phys ^ eip) as usize) as i32;
     *instruction_pointer = eip + 1;
     return Ok(data8);
 }
@@ -3318,7 +3319,7 @@ unsafe fn jit_run_interpreted(mut phys_addr: u32, instruction_limit: u32) {
         if vine_validate_execute_fetch(start_eip as u32).is_err() {
             break;
         }
-        let opcode = *memory::mem8.offset(phys_addr as isize) as i32;
+        let opcode = *memory::mem8.wrapping_add(phys_addr as usize) as i32;
         *instruction_pointer += 1;
         dbg_assert!(*prefixes == 0);
         run_instruction(opcode | (*is_32 as i32) << 8);

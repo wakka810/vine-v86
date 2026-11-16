@@ -17,6 +17,7 @@ const START = 0x1000;
 const DATA = 0x8000;
 const MEMORY_SIZE = 1024 * 1024;
 const TABLE_OFFSET = 1024;
+const CHAIN_OFFSET = TABLE_OFFSET + 900;
 const VIRTUAL_BASE = 0x400000;
 const PAGE_DIRECTORY = 0x10000;
 const PAGE_TABLE = 0x11000;
@@ -33,18 +34,29 @@ const entry_wrapper = new WebAssembly.Module(new Uint8Array([
     7, 5, 1, 1, 102, 0, 2,
     10, 10, 1, 8, 0, 16, 1, 32, 0, 16, 0, 11,
 ]));
+// A native tail wrapper counts chained entries without adding a stack frame.
+const section = (id, bytes) => [id, bytes.length, ...bytes];
+const chain_body = [0, 0x10, 1, ...Array.from({ length: 11 }, (_, i) => [0x20, i]).flat(), 0x12, 0, 11];
+const chain_wrapper = new WebAssembly.Module(new Uint8Array([
+    0, 97, 115, 109, 1, 0, 0, 0,
+    ...section(1, [2, 0x60, 11, ...Array(11).fill(0x7f), 0, 0x60, 0, 0]),
+    ...section(2, [2, 1, 101, 1, 103, 0, 0, 1, 101, 5, 101, 110, 116, 101, 114, 0, 1]),
+    ...section(3, [1, 0]), ...section(7, [1, 1, 103, 0, 2]),
+    ...section(10, [1, chain_body.length, ...chain_body]),
+]));
 
-function create_cpu(code, {
+export function create_cpu(code, {
     disable_jit = false, exact = true, cpu_module = module, paging = false, asynchronous = false,
-    on_finalize = null, on_mmap = null,
+    on_finalize = null, on_mmap = null, chaining = process.env.V86_TEST_CHAINING === "1",
+    instrument = true,
 } = {})
 {
-    const table = new WebAssembly.Table({ element: "anyfunc", initial: TABLE_OFFSET + 900 });
+    const table = new WebAssembly.Table({ element: "anyfunc", initial: CHAIN_OFFSET + 900 });
     let wasm;
     let jit_imports;
     let last_entry;
     let last_limit;
-    const counts = { entries: 0, reads: 0, modules: 0, invalidations: 0,
+    const counts = { entries: 0, chain_entries: 0, reads: 0, modules: 0, invalidations: 0,
         jit_slow_writes: 0, jit_slow_reads: 0, mmx_guards: 0, mmap: 0, fpu_imports: new Set() };
     const virtual_base = paging ? VIRTUAL_BASE : 0;
     const env = { __indirect_function_table: table };
@@ -64,6 +76,7 @@ function create_cpu(code, {
                     return 0;
                 case "jit_clear_func":
                     table.set(TABLE_OFFSET + args[0], null);
+                    table.set(CHAIN_OFFSET + args[0], null);
                     counts.invalidations++;
                     return;
                 case "console_log_from_wasm":
@@ -78,7 +91,7 @@ function create_cpu(code, {
                     counts.mmap++;
                     return on_mmap(imported.name, args, wasm);
                 case "codegen_finalize": {
-                    if(on_finalize) on_finalize(wasm);
+                    if(on_finalize) on_finalize(wasm, args);
                     const [index, start, state_flags, pointer, length] = args;
                     const bytes = Buffer.from(wasm.memory.buffer, pointer, length);
                     // Count the generated CR0 byte-load/mask/if sequence. The
@@ -91,11 +104,15 @@ function create_cpu(code, {
                     const generated = new WebAssembly.Module(bytes);
                     for(const dependency of WebAssembly.Module.imports(generated))
                         if(/^(fpu_|f32_to_f80)/.test(dependency.name)) counts.fpu_imports.add(dependency.name);
-                    const f = new WebAssembly.Instance(generated, { e: jit_imports }).exports.f;
-                    const wrapped = new WebAssembly.Instance(entry_wrapper, {
+                    const { f, g } = new WebAssembly.Instance(generated, { e: jit_imports }).exports;
+                    const wrapped = instrument ? new WebAssembly.Instance(entry_wrapper, {
                         e: { f, enter: () => counts.entries++ },
-                    }).exports.f;
+                    }).exports.f : f;
                     table.set(TABLE_OFFSET + index, wrapped);
+                    table.set(CHAIN_OFFSET + index, g === undefined ? null : !instrument ? g :
+                        new WebAssembly.Instance(chain_wrapper, {
+                            e: { g, enter: () => counts.chain_entries++ },
+                        }).exports.g);
                     last_entry = wrapped;
                     if(!exact) assert(!WebAssembly.Module.imports(generated).some(
                         dependency => dependency.name === "vine_jit_instruction_limit"));
@@ -110,21 +127,24 @@ function create_cpu(code, {
         };
     }
     wasm = new WebAssembly.Instance(cpu_module, { env }).exports;
-    jit_imports = { ...wasm, m: wasm.memory };
-    jit_imports.vine_jit_instruction_limit = () => {
+    jit_imports = { ...wasm, m: wasm.memory, t: table };
+    if(instrument) jit_imports.vine_jit_instruction_limit = () => {
         counts.reads++;
         last_limit = wasm.vine_jit_instruction_limit() >>> 0;
         return last_limit;
     };
-    jit_imports.safe_write8_slow_jit = (...args) => {
+    if(instrument) jit_imports.safe_write8_slow_jit = (...args) => {
         counts.jit_slow_writes++;
         return wasm.safe_write8_slow_jit(...args);
     };
-    jit_imports.safe_read32s_slow_jit = (...args) => {
+    if(instrument) jit_imports.safe_read32s_slow_jit = (...args) => {
         counts.jit_slow_reads++;
         return wasm.safe_read32s_slow_jit(...args);
     };
     wasm.rust_init();
+    if(typeof wasm.vine_set_jit_chaining === "function")
+        assert.equal(wasm.vine_set_jit_chaining(Number(chaining)), 0);
+    else assert(!chaining || cpu_module === baseline_module, "chaining requires a capable test CPU");
     assert.equal(wasm.vine_set_memory_size(MEMORY_SIZE), 0);
     const physical_base = wasm.allocate_memory(MEMORY_SIZE);
     wasm.reset_cpu();
@@ -245,8 +265,13 @@ function create_cpu(code, {
         },
         run_unbounded_entry() {
             assert(last_entry);
+            const before = wasm.vine_instruction_counter();
             last_entry(0);
             assert.equal(last_limit, 0xFFFFFFFF);
+            const instructions = (wasm.vine_instruction_counter() - before) >>> 0;
+            assert(instructions > 0 && instructions <= 100003,
+                "an idle public getter must still produce a bounded JIT invocation");
+            return instructions;
         },
         full_snapshot() {
             wasm.vine_cpu_state_save();
@@ -262,6 +287,7 @@ function create_cpu(code, {
             };
         },
         assert_hoisted() {
+            assert(instrument, "entry assertions require the instrumented helper");
             assert(counts.entries > 0, "test must execute compiled code");
             assert.equal(counts.reads, exact ? counts.entries : 0,
                 "read the budget once per JIT invocation, and never with checks disabled");
@@ -1089,16 +1115,92 @@ for(const opcode of [0xd9, 0xd8])
 
 const ordinary = create_cpu(loops[0][1]);
 ordinary.execute(131072);
-ordinary.run_unbounded_entry();
+const ordinary_instructions = ordinary.run_unbounded_entry();
 ordinary.assert_hoisted();
 if(baseline_module)
 {
     const baseline = create_cpu(loops[0][1], { cpu_module: baseline_module });
     baseline.execute(131072);
-    baseline.run_unbounded_entry();
-    assert.deepEqual(ordinary.full_snapshot(), baseline.full_snapshot());
+    // The old watchdog could cross its threshold by one block. Compare the
+    // exact same work after the new entry bound stops before that block.
+    baseline.execute(ordinary_instructions);
+    const direct = ordinary.full_snapshot();
+    // Calling the generated entry directly bypasses the CPU dispatcher's JIT
+    // statistics accumulator. Account for that known work in the comparison.
+    direct.jit += BigInt(ordinary_instructions);
+    assert.deepEqual(direct, baseline.full_snapshot());
 }
 console.log("ordinary non-Vine JIT invocation: unbounded getter passed");
+
+for(const chaining of [false, true]) {
+    // inc eax; dec ebx; jnz start; hlt. A maximal public budget must not wrap
+    // the local block charge, and native entries must keep yielding internally.
+    const { jit, cpus, execute } = create_pair([0x40, 0x4B, 0x75, 0xFC, 0xF4],
+        { chaining }, { compare_retired_partition: false, allow_budget_previous_eip: true });
+    for(const c of cpus) c.set_register(3, 1000000);
+    execute(131072, "maximal budget warmup");
+    await Promise.resolve();
+    execute(131072, "maximal budget compiled warmup");
+    const entries = jit.counts.entries;
+    for(const c of cpus) { c.resume(0); c.set_register(3, 100010); c.set_counter(0xFFFFFFF0); }
+    const r = execute(0xFFFFFFFF, "maximal budget finite loop and wrapped global counter");
+    assert.equal(r.reason, 2);
+    assert.equal(r.registers[0], 100010);
+    assert(jit.counts.entries > entries + 1, "a finite invocation bound must yield before HLT");
+}
+console.log("maximal budget: finite compiled entries, global wrap and full state passed");
+
+// Pulling a CALL target into another module must keep every existing entry on
+// that target page callable. Otherwise a warm indirect entry becomes interpreted
+// again and rebuilding either caller repeatedly evicts the other entry set.
+for(const asynchronous of [false, true]) {
+    const code = new Uint8Array(0x1040).fill(0x90);
+    code.set([0xe8, 0xfb, 0x0f, 0, 0, 0xeb, 0xf9]);
+    code[0xe00] = 0xf4;
+    code.set([0x40, 0xc3], 0x1000);
+    code.set([0x83, 0xc0, 7, 0xc3], 0x1020);
+    const modules = [];
+    const cpu = create_cpu(code, { paging: true, asynchronous, on_finalize(_wasm, args) {
+        modules.push({ index: args[0], flags: args[2] });
+    } });
+    async function run(address, expected) {
+        cpu.physical.setUint32(0x90000, VIRTUAL_BASE + 0x1e00, true);
+        cpu.resume(0, address);
+        const result = cpu.execute(address === START ? 4096 : 256);
+        await Promise.resolve();
+        assert.equal(result.reason, address === START ? 1 : 0x10d,
+            "caller yields on budget; direct callee returns to user-mode HLT #GP");
+        assert.equal(result.eip, VIRTUAL_BASE + (address === START ? START : 0x1e00));
+        assert.equal(result.registers[0], expected);
+    }
+    function cached(address) {
+        return modules.some(({ index, flags }) =>
+            cpu.wasm.jit_find_cache_entry_in_page(VIRTUAL_BASE + address, index, flags) >= 0);
+    }
+    await run(0x2000, 1);
+    await run(0x2020, 7);
+    assert(cached(0x2000) && cached(0x2020), "both callee entries are warm");
+    cpu.resume(0, START);
+    const entered = cpu.execute(1); // Stop after CALL, before the callee can recompile.
+    await Promise.resolve();
+    assert.equal(entered.eip, VIRTUAL_BASE + 0x2000);
+    assert(cached(0x2000) && cached(0x2020), "CALL folding preserves both callee entries");
+    await run(START, 1024);
+    const compiled = cpu.counts.modules;
+    for(let i = 0; i < 8; i++) {
+        await run(0x2000, 1);
+        await run(0x2020, 7);
+        await run(START, 1024);
+    }
+    assert.equal(cpu.counts.modules, compiled, "alternating warm entries does not recompile");
+    // Replacing the callee bytes still invalidates every module that folded it.
+    cpu.wasm.jit_dirty_cache(0x2000, 0x3000);
+    cpu.physical.setUint8(0x2000, 0x48); // DEC EAX replaces INC EAX.
+    assert(!cached(0x2000) && !cached(0x2020), "code mutation retires the shared page");
+    await run(0x2000, 0xffffffff);
+    await run(START, 0xfffffc00);
+    console.log(`cross-page CALL: retained entries, warm reuse and dependent invalidation passed (async=${asynchronous})`);
+}
 
 // SBB32 same-register lowering preserves raw lazy flags and subsequent reads.
 {

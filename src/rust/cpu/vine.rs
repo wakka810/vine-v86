@@ -61,6 +61,41 @@ static mut DIRTY_PAGE_BITMAP: [u8; EXECUTE_BITMAP_BYTES] = [0; EXECUTE_BITMAP_BY
 static mut DIRTY_PAGES: [u32; DIRTY_PAGE_CAPACITY] = [0; DIRTY_PAGE_CAPACITY];
 static mut DIRTY_PAGE_COUNT: usize = 0;
 static mut DIRTY_PAGE_OVERFLOWED: bool = false;
+static mut COMMON_MEMORY: Option<(u32, u32)> = None;
+static mut COMMON_FASTMEM: bool = true;
+
+/// Only the statically linked Runtime may select this. Data stores already
+/// change authoritative bytes; code invalidation remains independent.
+pub unsafe fn set_common_memory(base: u32, permissions: u32) {
+    assert!(!crate::cpu::cpu::vine_execution_is_active());
+    vine_reset_dirty_pages();
+    COMMON_MEMORY = Some((base, permissions));
+}
+
+pub unsafe fn common_memory() -> Option<(u32, u32)> {
+    if COMMON_FASTMEM { COMMON_MEMORY } else { None }
+}
+
+pub unsafe fn invalidate_common_page(page: Option<u32>) {
+    assert!(!crate::cpu::cpu::vine_execution_is_active());
+    match page {
+        Some(address) => crate::jit::jit_dirty_cache(0x800000 + address, 0x800000 + address + 4096),
+        None => {
+            crate::cpu::cpu::full_clear_tlb();
+            crate::jit::jit_clear_cache_js();
+        },
+    }
+}
+
+#[no_mangle]
+pub unsafe fn vine_set_common_fastmem(enabled: u32) -> u32 {
+    if enabled > 1 || crate::cpu::cpu::vine_execution_is_active() { return 1; }
+    if COMMON_FASTMEM != (enabled != 0) {
+        crate::jit::jit_clear_cache_js();
+        COMMON_FASTMEM = enabled != 0;
+    }
+    0
+}
 
 unsafe fn state_ptr() -> *mut u32 { (&raw mut STATE).cast::<u32>() }
 
@@ -121,6 +156,7 @@ pub unsafe fn execute_fetch_allowed(address: u32) -> bool {
 
 #[inline]
 pub unsafe fn mark_guest_page_dirty(address: u32) {
+    if matches!(COMMON_MEMORY, Some(_)) { return; }
     let page = address >> X86_PAGE_SHIFT;
     let byte_index = (page >> 3) as usize;
     let mask = 1 << (page & 7);

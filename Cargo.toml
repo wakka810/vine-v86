@@ -9,7 +9,7 @@ default = []
 profiler = []
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 path = "src/rust/lib.rs"
 
 [profile.test]

@@ -101,8 +101,11 @@ pub fn gen_page_switch_check(
     gen_get_phys_eip_plus_mem(ctx, &address_local);
     ctx.builder.free_local(address_local);
 
-    ctx.builder
-        .const_i32(next_block_addr as i32 + unsafe { memory::mem8 } as i32);
+    // The host may move RAM while the CPU is stopped without retiring this
+    // module. Compare against the current allocation, never its former base.
+    ctx.builder.const_i32(next_block_addr as i32);
+    ctx.builder.load_fixed_i32((&raw const memory::mem8) as u32);
+    ctx.builder.add_i32();
     ctx.builder.ne_i32();
 
     if cfg!(debug_assertions) {
@@ -639,6 +642,43 @@ pub fn gen_safe_write128(
     )
 }
 
+// Common memory is restricted to Runtime-owned user mappings. Its permission
+// table covers every u32 address; denied/unmapped/high pages take the existing
+// precise slow path. Writable executable pages never use direct stores, so the
+// original SMC barrier and interpreter retry remain in force.
+fn gen_memory_guard(ctx: &mut JitContext, address: &WasmLocal, read: bool, write: bool) -> (WasmLocal, bool) {
+    if let Some((base, permissions)) = unsafe { crate::cpu::vine::common_memory() }
+        .filter(|_| ctx.cpu.cpl3() && !cfg!(feature = "profiler")) {
+        ctx.builder.get_local(address);
+        ctx.builder.const_i32(base as i32); ctx.builder.add_i32();
+        let entry = ctx.builder.set_new_local();
+        ctx.builder.get_local(address); ctx.builder.const_i32(12); ctx.builder.shr_u_i32();
+        ctx.builder.load_u8(permissions);
+        let mask = i32::from(read) | i32::from(write) << 1;
+        ctx.builder.const_i32(mask); ctx.builder.and_i32();
+        ctx.builder.const_i32(mask); ctx.builder.eq_i32();
+        (entry, true)
+    } else {
+        ctx.builder.get_local(address); ctx.builder.const_i32(12); ctx.builder.shr_u_i32();
+        ctx.builder.const_i32(2); ctx.builder.shl_i32();
+        ctx.builder.load_aligned_i32(unsafe { &tlb_data[0] as *const i32 as u32 });
+        let entry = ctx.builder.tee_new_local();
+        let mask = 0xfff & !TLB_GLOBAL & !(if ctx.cpu.cpl3() { 0 } else { TLB_NO_USER })
+            & !(if write { 0 } else { TLB_READONLY | TLB_HAS_CODE });
+        ctx.builder.const_i32(mask); ctx.builder.and_i32();
+        ctx.builder.const_i32(TLB_VALID); ctx.builder.eq_i32();
+        (entry, false)
+    }
+}
+
+fn gen_resolved_memory_address(ctx: &mut JitContext, entry: &WasmLocal, address: &WasmLocal, common: bool) {
+    ctx.builder.get_local(entry);
+    if !common {
+        ctx.builder.const_i32(!0xfff); ctx.builder.and_i32();
+        ctx.builder.get_local(address); ctx.builder.xor_i32();
+    }
+}
+
 fn gen_safe_read(
     ctx: &mut JitContext,
     bits: BitSize,
@@ -655,28 +695,7 @@ fn gen_safe_read(
     //   fast: mem[(entry & ~0xFFF) ^ addr]
 
     let cont = ctx.builder.block_void();
-    ctx.builder.get_local(&address_local);
-
-    ctx.builder.const_i32(12);
-    ctx.builder.shr_u_i32();
-    ctx.builder.const_i32(2);
-    ctx.builder.shl_i32();
-
-    ctx.builder
-        .load_aligned_i32(unsafe { &tlb_data[0] as *const i32 as u32 });
-    let entry_local = ctx.builder.tee_new_local();
-
-    ctx.builder.const_i32(
-        (0xFFF
-            & !TLB_READONLY
-            & !TLB_GLOBAL
-            & !TLB_HAS_CODE
-            & !(if ctx.cpu.cpl3() { 0 } else { TLB_NO_USER })) as i32,
-    );
-    ctx.builder.and_i32();
-
-    ctx.builder.const_i32(TLB_VALID as i32);
-    ctx.builder.eq_i32();
+    let (entry_local, common) = gen_memory_guard(ctx, address_local, true, false);
 
     if bits != BitSize::BYTE {
         ctx.builder.get_local(&address_local);
@@ -731,16 +750,16 @@ fn gen_safe_read(
     }
 
     ctx.builder.br_if(ctx.exit_with_fault_label);
+    if common {
+        gen_resolved_memory_address(ctx, &entry_local, address_local, false);
+        ctx.builder.set_local(&entry_local);
+    }
 
     ctx.builder.block_end();
 
     gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_READ_FAST); // XXX: Both fast and slow
 
-    ctx.builder.get_local(&entry_local);
-    ctx.builder.const_i32(!0xFFF);
-    ctx.builder.and_i32();
-    ctx.builder.get_local(&address_local);
-    ctx.builder.xor_i32();
+    gen_resolved_memory_address(ctx, &entry_local, address_local, common);
 
     // where_to_write is only used by dqword
     dbg_assert!((where_to_write != None) == (bits == BitSize::DQWORD));
@@ -871,23 +890,7 @@ fn gen_safe_write(
     //   fast: mem[(entry & ~0xFFF) ^ addr] <- value
 
     let cont = ctx.builder.block_void();
-    ctx.builder.get_local(&address_local);
-
-    ctx.builder.const_i32(12);
-    ctx.builder.shr_u_i32();
-    ctx.builder.const_i32(2);
-    ctx.builder.shl_i32();
-
-    ctx.builder
-        .load_aligned_i32(unsafe { &tlb_data[0] as *const i32 as u32 });
-    let entry_local = ctx.builder.tee_new_local();
-
-    ctx.builder
-        .const_i32((0xFFF & !TLB_GLOBAL & !(if ctx.cpu.cpl3() { 0 } else { TLB_NO_USER })) as i32);
-    ctx.builder.and_i32();
-
-    ctx.builder.const_i32(TLB_VALID as i32);
-    ctx.builder.eq_i32();
+    let (entry_local, common) = gen_memory_guard(ctx, address_local, false, true);
 
     if bits != BitSize::BYTE {
         ctx.builder.get_local(&address_local);
@@ -957,16 +960,16 @@ fn gen_safe_write(
     }
 
     ctx.builder.br_if(ctx.exit_with_fault_label);
+    if common {
+        gen_resolved_memory_address(ctx, &entry_local, address_local, false);
+        ctx.builder.set_local(&entry_local);
+    }
 
     ctx.builder.block_end();
 
     gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_WRITE_FAST); // XXX: Both fast and slow
 
-    ctx.builder.get_local(&entry_local);
-    ctx.builder.const_i32(!0xFFF);
-    ctx.builder.and_i32();
-    ctx.builder.get_local(&address_local);
-    ctx.builder.xor_i32();
+    gen_resolved_memory_address(ctx, &entry_local, address_local, common);
 
     match value_local {
         GenSafeWriteValue::I32(local) => ctx.builder.get_local(local),
@@ -1023,23 +1026,7 @@ pub fn gen_safe_read_write(
     //   mem[(entry & ~0xFFF) ^ addr] <- value
 
     let cont = ctx.builder.block_void();
-    ctx.builder.get_local(address_local);
-
-    ctx.builder.const_i32(12);
-    ctx.builder.shr_u_i32();
-    ctx.builder.const_i32(2);
-    ctx.builder.shl_i32();
-
-    ctx.builder
-        .load_aligned_i32(unsafe { &tlb_data[0] as *const i32 as u32 });
-    let entry_local = ctx.builder.tee_new_local();
-
-    ctx.builder
-        .const_i32((0xFFF & !TLB_GLOBAL & !(if ctx.cpu.cpl3() { 0 } else { TLB_NO_USER })) as i32);
-    ctx.builder.and_i32();
-
-    ctx.builder.const_i32(TLB_VALID as i32);
-    ctx.builder.eq_i32();
+    let (entry_local, common) = gen_memory_guard(ctx, address_local, true, true);
 
     if bits != BitSize::BYTE {
         ctx.builder.get_local(&address_local);
@@ -1100,16 +1087,16 @@ pub fn gen_safe_read_write(
     }
 
     ctx.builder.br_if(ctx.exit_with_fault_label);
+    if common {
+        gen_resolved_memory_address(ctx, &entry_local, address_local, false);
+        ctx.builder.set_local(&entry_local);
+    }
 
     ctx.builder.block_end();
 
     gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_READ_WRITE_FAST); // XXX: Also slow
 
-    ctx.builder.get_local(&entry_local);
-    ctx.builder.const_i32(!0xFFF);
-    ctx.builder.and_i32();
-    ctx.builder.get_local(&address_local);
-    ctx.builder.xor_i32();
+    gen_resolved_memory_address(ctx, &entry_local, address_local, common);
 
     ctx.builder.free_local(entry_local);
     let phys_addr_local = ctx.builder.tee_new_local();

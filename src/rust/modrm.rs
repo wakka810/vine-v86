@@ -17,6 +17,10 @@ pub struct ModrmByte {
     is_16: bool,
 }
 impl ModrmByte {
+    pub fn flat_parts(&self) -> Option<(Option<u32>, Option<u32>, u8, i32)> {
+        if self.is_16 || !matches!(self.segment, DS | SS) { return None; }
+        Some((self.first_reg, self.second_reg, self.shift, self.immediate))
+    }
     pub fn is_nop(&self, reg: u32) -> bool {
         self.first_reg == Some(reg)
             && self.second_reg.is_none()
