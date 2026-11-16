@@ -385,7 +385,7 @@
                     (i32.add
                       (i32.const 4101)
                       (i32.load
-                        (i32.const 110860))))
+                        (i32.const {normalised output}))))
                   (then
                     (br $B0)))
                 (set_local $p0

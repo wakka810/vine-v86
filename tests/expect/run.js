@@ -66,6 +66,12 @@ function normalise_wast(wast)
             {
                 return match;
             }
+        }).replace(/\(i32\.load(\s+)\(i32\.const (\d+)\)\)/g, function(match, spacing, address)
+        {
+            // Rust statics such as memory::mem8 also use direct loads. Their
+            // addresses depend on the linker, unlike fixed CPU-state offsets.
+            return Number(address) >= MIN_MEMORY_OFFSET ?
+                `(i32.load${spacing}(i32.const {normalised output}))` : match;
         }).replace(/memory \$[\w\.]+ \d+/g, "memory {normalised output}");
 }
 
