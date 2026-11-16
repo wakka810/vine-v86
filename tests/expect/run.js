@@ -80,7 +80,7 @@ function run_test({ name, executable_file, expect_file, actual_file, actual_wasm
     const executable = fs.readFileSync(executable_file);
     const asm = fs.readFileSync(asm_file);
 
-    const is_32 = asm.includes("BITS 32\n");
+    const is_32 = asm.includes("BITS 32\n") || asm.includes("BITS 32\r\n");
 
     emulator.add_listener("emulator-loaded", function()
         {
@@ -116,6 +116,7 @@ function run_test({ name, executable_file, expect_file, actual_file, actual_wasm
 
                 const result = spawnSync("git",
                     [].concat(
+                        "-c", "core.safecrlf=false",
                         "diff",
                         GIT_DIFF_FLAGS,
                         expect_file_for_diff,
