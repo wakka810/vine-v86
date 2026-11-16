@@ -1273,9 +1273,14 @@ if(cluster.isPrimary)
 
     for(var i = 0; i < nr_of_cpus; i++)
     {
+        start_worker();
+    }
+
+    function start_worker()
+    {
         var worker = cluster.fork();
 
-        worker.on("message", send_work_to_worker.bind(null, worker));
+        worker.once("message", send_work_to_worker.bind(null, worker));
 
         worker.on("exit", function(code, signal)
         {
@@ -1287,6 +1292,10 @@ if(cluster.isPrimary)
             else if(code !== 0)
             {
                 process.exit(code);
+            }
+            else if(current_test < tests.length)
+            {
+                start_worker();
             }
         });
 
@@ -1303,7 +1312,9 @@ else
     {
         run_test(test_case, function()
         {
-            process.send("I'm done");
+            // Release each VM and its compiled Wasm before the next scenario,
+            // independent of V8's garbage-collection timing in long CI runs.
+            process.exit(0);
         });
     });
     process.send("up");
