@@ -7,23 +7,23 @@
   (type $t5 (func (result i64)))
   (type $t6 (func (param i32) (result i32)))
   (type $t7 (func (param i32 i32) (result i32)))
-  (type $t8 (func (param i32) (result i64)))
-  (type $t9 (func (param f32) (result i32)))
-  (type $t10 (func (param f64) (result i32)))
-  (type $t11 (func (param i32 i64)))
-  (type $t12 (func (param i64 i32)))
-  (type $t13 (func (param i64 i32) (result i32)))
-  (type $t14 (func (param i64 i32) (result i64)))
-  (type $t15 (func (param f32 i32)))
-  (type $t16 (func (param i32 i32 i32) (result i32)))
-  (type $t17 (func (param i64 i32 i32)))
-  (type $t18 (func (param i32 i64 i32)))
-  (type $t19 (func (param i32 i64 i32) (result i32)))
-  (type $t20 (func (param i32 i64 i64 i32) (result i32)))
+  (type $t8 (func (param f32) (result i32)))
+  (type $t9 (func (param f64) (result i32)))
+  (type $t10 (func (param i32 i64)))
+  (type $t11 (func (param i64 i32)))
+  (type $t12 (func (param i64 i32) (result i32)))
+  (type $t13 (func (param i64 i32) (result i64)))
+  (type $t14 (func (param f32 i32)))
+  (type $t15 (func (param i32 i32 i32) (result i32)))
+  (type $t16 (func (param i64 i32 i32)))
+  (type $t17 (func (param i32 i64 i32)))
+  (type $t18 (func (param i32 i64 i32) (result i32)))
+  (type $t19 (func (param i32 i64 i64 i32) (result i32)))
+  (import "e" "vine_jit_instruction_limit" (func $e.vine_jit_instruction_limit (type $t4)))
   (import "e" "exit_jit" (func $e.exit_jit (type $t0)))
   (import "e" "m" (memory {normalised output}))
   (func $f (export "f") (type $t1) (param $p0 i32)
-    (local $l0 i32) (local $l1 i32) (local $l2 i32) (local $l3 i32) (local $l4 i32) (local $l5 i32) (local $l6 i32) (local $l7 i32) (local $l8 i32)
+    (local $l0 i32) (local $l1 i32) (local $l2 i32) (local $l3 i32) (local $l4 i32) (local $l5 i32) (local $l6 i32) (local $l7 i32) (local $l8 i32) (local $l9 i32)
     (set_local $l0
       (i32.load
         (i32.const 64)))
@@ -50,6 +50,8 @@
         (i32.const 92)))
     (set_local $l8
       (i32.const 0))
+    (set_local $l9
+      (call $e.vine_jit_instruction_limit))
     (block $B0
       (block $B1
         (loop $L2
@@ -60,6 +62,22 @@
           (block $B3
             (block $B4
             )
+            (if $I5
+              (i32.gt_u
+                (i32.add
+                  (get_local $l8)
+                  (i32.const 1))
+                (get_local $l9))
+              (then
+                (i32.store
+                  (i32.const 556)
+                  (i32.or
+                    (i32.and
+                      (i32.load
+                        (i32.const 556))
+                      (i32.const -4096))
+                    (i32.const 0)))
+                (br $B0)))
             (set_local $l8
               (i32.add
                 (get_local $l8)
