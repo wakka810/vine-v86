@@ -62,6 +62,9 @@ jobs:
       - name: rustfmt check
         run: make rustfmt
 
+      - name: Run rust-test
+        run: make rust-test
+
       - name: Fetch kvm-unit-test cache
         uses: actions/cache@v5
         id: cache-kvm-unit-test
@@ -91,9 +94,6 @@ jobs:
 
       - name: Run nasmtests-force-jit
         run: MAX_PARALLEL_TESTS=1 make nasmtests-force-jit
-
-      - name: Run rust-test
-        run: make rust-test
 
       - name: Fetch image cache
         uses: actions/cache@v5
