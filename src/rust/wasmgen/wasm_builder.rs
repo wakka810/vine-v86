@@ -189,7 +189,9 @@ impl WasmBuilder {
         dbg_assert!(self.label_stack.is_empty());
 
         self.write_memory_import();
-        if self.is_chained() { self.write_chain_table_import(); }
+        if self.is_chained() {
+            self.write_chain_table_import();
+        }
         self.write_function_section();
         self.write_export_section();
 
@@ -436,12 +438,27 @@ impl WasmBuilder {
                     self.output.push(op::TYPE_I32);
                 },
                 FunctionType::FN4_I64_I32_I64_I32_RET_I64 => {
-                    self.output.extend([op::TYPE_FUNC, 4, op::TYPE_I64, op::TYPE_I32,
-                        op::TYPE_I64, op::TYPE_I32, 1, op::TYPE_I64]);
+                    self.output.extend([
+                        op::TYPE_FUNC,
+                        4,
+                        op::TYPE_I64,
+                        op::TYPE_I32,
+                        op::TYPE_I64,
+                        op::TYPE_I32,
+                        1,
+                        op::TYPE_I64,
+                    ]);
                 },
                 FunctionType::FN4_I64_I32_I64_I32 => {
-                    self.output.extend([op::TYPE_FUNC, 4, op::TYPE_I64, op::TYPE_I32,
-                        op::TYPE_I64, op::TYPE_I32, 0]);
+                    self.output.extend([
+                        op::TYPE_FUNC,
+                        4,
+                        op::TYPE_I64,
+                        op::TYPE_I32,
+                        op::TYPE_I64,
+                        op::TYPE_I32,
+                        0,
+                    ]);
                 },
                 FunctionType::FN11 => {
                     self.output.extend([op::TYPE_FUNC, 11]);
@@ -527,9 +544,12 @@ impl WasmBuilder {
 
     fn write_chain_table_import(&mut self) {
         let before = self.output.len();
-        self.output.extend([1, b'e', 1, b't', op::EXT_TABLE, op::TYPE_ANYFUNC, 0]);
-        write_leb_u32(&mut self.output,
-            crate::cpu::cpu::WASM_TABLE_OFFSET + 2 * crate::jit::WASM_TABLE_SIZE);
+        self.output
+            .extend([1, b'e', 1, b't', op::EXT_TABLE, op::TYPE_ANYFUNC, 0]);
+        write_leb_u32(
+            &mut self.output,
+            crate::cpu::cpu::WASM_TABLE_OFFSET + 2 * crate::jit::WASM_TABLE_SIZE,
+        );
         self.set_import_count(self.import_count + 1);
         self.set_import_table_size(self.import_table_size + self.output.len() - before);
     }
@@ -556,7 +576,9 @@ impl WasmBuilder {
         self.output.push(if self.is_chained() { 3 } else { 2 });
         self.output.push(if self.is_chained() { 2 } else { 1 });
         self.output.push(FunctionType::FN1.to_u8());
-        if self.is_chained() { self.output.push(FunctionType::FN11.to_u8()); }
+        if self.is_chained() {
+            self.output.push(FunctionType::FN11.to_u8());
+        }
     }
 
     pub fn write_export_section(&mut self) {
@@ -598,7 +620,8 @@ impl WasmBuilder {
 
     pub fn return_call_chain(&mut self) {
         dbg_assert!(self.is_chained());
-        self.instruction_body.extend([op::OP_RETURN_CALLINDIRECT, FunctionType::FN11.to_u8(), 0]);
+        self.instruction_body
+            .extend([op::OP_RETURN_CALLINDIRECT, FunctionType::FN11.to_u8(), 0]);
     }
 
     fn get_fn_idx(&mut self, fn_name: &str, type_index: FunctionType) -> u16 {
@@ -641,13 +664,11 @@ impl WasmBuilder {
     }
     pub fn can_allocate_temporary_locals(&self, additional: u8) -> bool {
         // Local indices currently use a single-byte LEB encoding.
-        self.local_count as usize + self.argument_count as usize
-            + additional as usize <= 128
+        self.local_count as usize + self.argument_count as usize + additional as usize <= 128
     }
     pub fn free_local(&mut self, local: WasmLocal) {
         dbg_assert!(
-            (self.argument_count..self.local_count + self.argument_count)
-                .contains(&local.0)
+            (self.argument_count..self.local_count + self.argument_count).contains(&local.0)
         );
         self.free_locals_i32.push(local)
     }
@@ -692,8 +713,7 @@ impl WasmBuilder {
     }
     pub fn free_local_i64(&mut self, local: WasmLocalI64) {
         dbg_assert!(
-            (self.argument_count..self.local_count + self.argument_count)
-                .contains(&local.0)
+            (self.argument_count..self.local_count + self.argument_count).contains(&local.0)
         );
         self.free_locals_i64.push(local)
     }
@@ -916,6 +936,8 @@ impl WasmBuilder {
         self.instruction_body.extend(bytes);
     }
     pub fn bitselect_v128(&mut self) { self.simd(op::SIMD_V128_BITSELECT); }
+    pub fn and_v128(&mut self) { self.simd(op::SIMD_V128_AND); }
+    pub fn xor_v128(&mut self) { self.simd(op::SIMD_V128_XOR); }
     pub fn splat_i64x2(&mut self) { self.simd(op::SIMD_I64X2_SPLAT); }
     pub fn extract_i64x2_lane(&mut self, lane: u8) {
         dbg_assert!(lane < 2);
@@ -926,11 +948,16 @@ impl WasmBuilder {
     pub fn trunc_sat_f32x4_s(&mut self) { self.simd(op::SIMD_I32X4_TRUNC_SAT_F32X4_S); }
     pub fn i8x16_narrow_i16x8_u(&mut self) { self.simd(op::SIMD_I8X16_NARROW_I16X8_U); }
     pub fn i16x8_narrow_i32x4_s(&mut self) { self.simd(op::SIMD_I16X8_NARROW_I32X4_S); }
+    pub fn shl_i16x8(&mut self) { self.simd(op::SIMD_I16X8_SHL); }
     pub fn shr_s_i16x8(&mut self) { self.simd(op::SIMD_I16X8_SHR_S); }
     pub fn shr_u_i16x8(&mut self) { self.simd(op::SIMD_I16X8_SHR_U); }
     pub fn add_i16x8(&mut self) { self.simd(op::SIMD_I16X8_ADD); }
     pub fn sub_i16x8(&mut self) { self.simd(op::SIMD_I16X8_SUB); }
     pub fn mul_i16x8(&mut self) { self.simd(op::SIMD_I16X8_MUL); }
+    pub fn shr_s_i32x4(&mut self) { self.simd(op::SIMD_I32X4_SHR_S); }
+    pub fn add_i32x4(&mut self) { self.simd(op::SIMD_I32X4_ADD); }
+    pub fn dot_i16x8_s(&mut self) { self.simd(op::SIMD_I32X4_DOT_I16X8_S); }
+    pub fn extmul_low_i16x8_s(&mut self) { self.simd(op::SIMD_I32X4_EXTMUL_LOW_I16X8_S); }
     pub fn add_f32x4(&mut self) { self.simd(op::SIMD_F32X4_ADD); }
     pub fn sub_f32x4(&mut self) { self.simd(op::SIMD_F32X4_SUB); }
     pub fn mul_f32x4(&mut self) { self.simd(op::SIMD_F32X4_MUL); }

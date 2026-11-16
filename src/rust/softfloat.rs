@@ -119,7 +119,9 @@ impl F80 {
 
     pub fn of_f64(src: u64) -> F80 {
         if crate::fast_x87::enabled() {
-            if let Some(value) = crate::fast_x87::from_native(f64::from_bits(src)) { return value; }
+            if let Some(value) = crate::fast_x87::from_native(f64::from_bits(src)) {
+                return value;
+            }
         }
         let mut x = F80::ZERO;
         unsafe { f64_to_extF80M(src, &mut x) };
@@ -131,34 +133,50 @@ impl F80 {
         if crate::fast_x87::enabled() {
             if let Some(value) = crate::fast_x87::to_native(*self) {
                 let short = value as f32;
-                if short.is_normal() || value == 0.0 { return short.to_bits() as i32; }
+                if short.is_normal() || value == 0.0 {
+                    return short.to_bits() as i32;
+                }
             }
         }
         unsafe { extF80M_to_f32(self) }
     }
     pub fn to_f64(&self) -> u64 {
         if crate::fast_x87::enabled() {
-            if let Some(value) = crate::fast_x87::to_native(*self) { return value.to_bits(); }
+            if let Some(value) = crate::fast_x87::to_native(*self) {
+                return value.to_bits();
+            }
         }
         unsafe { extF80M_to_f64(self) }
     }
     fn to_f64x(&self) -> f64 { f64::from_bits(self.to_f64()) }
 
     pub fn to_i32(&self) -> i32 {
-        if let Some(value) = crate::fast_x87::integer(*self, false).and_then(|x| i32::try_from(x).ok()) { return value; }
+        if let Some(value) =
+            crate::fast_x87::integer(*self, false).and_then(|x| i32::try_from(x).ok())
+        {
+            return value;
+        }
         unsafe { extF80M_to_i32(self, softfloat_roundingMode, false) }
     }
     pub fn to_i64(&self) -> i64 {
-        if let Some(value) = crate::fast_x87::integer(*self, false) { return value; }
+        if let Some(value) = crate::fast_x87::integer(*self, false) {
+            return value;
+        }
         unsafe { extF80M_to_i64(self, softfloat_roundingMode, false) }
     }
 
     pub fn truncate_to_i32(&self) -> i32 {
-        if let Some(value) = crate::fast_x87::integer(*self, true).and_then(|x| i32::try_from(x).ok()) { return value; }
+        if let Some(value) =
+            crate::fast_x87::integer(*self, true).and_then(|x| i32::try_from(x).ok())
+        {
+            return value;
+        }
         unsafe { extF80M_to_i32(self, 1, false) }
     }
     pub fn truncate_to_i64(&self) -> i64 {
-        if let Some(value) = crate::fast_x87::integer(*self, true) { return value; }
+        if let Some(value) = crate::fast_x87::integer(*self, true) {
+            return value;
+        }
         unsafe { extF80M_to_i64(self, 1, false) }
     }
 
@@ -190,7 +208,9 @@ impl F80 {
     }
 
     pub fn sqrt(self) -> F80 {
-        if let Some(value) = crate::fast_x87::sqrt(self) { return value; }
+        if let Some(value) = crate::fast_x87::sqrt(self) {
+            return value;
+        }
         let mut result = F80::ZERO;
         unsafe { extF80M_sqrt(&self, &mut result) };
         result
@@ -252,7 +272,9 @@ impl F80 {
 impl std::ops::Add for F80 {
     type Output = F80;
     fn add(self, other: Self) -> Self {
-        if let Some(value) = crate::fast_x87::binary(self, other, 0) { return value; }
+        if let Some(value) = crate::fast_x87::binary(self, other, 0) {
+            return value;
+        }
         let mut result = F80::ZERO;
         unsafe { extF80M_add(&self, &other, &mut result) };
         result
@@ -261,7 +283,9 @@ impl std::ops::Add for F80 {
 impl std::ops::Sub for F80 {
     type Output = F80;
     fn sub(self, other: Self) -> Self {
-        if let Some(value) = crate::fast_x87::binary(self, other, 1) { return value; }
+        if let Some(value) = crate::fast_x87::binary(self, other, 1) {
+            return value;
+        }
         let mut result = F80::ZERO;
         unsafe { extF80M_sub(&self, &other, &mut result) };
         result
@@ -278,7 +302,9 @@ impl std::ops::Neg for F80 {
 impl std::ops::Mul for F80 {
     type Output = F80;
     fn mul(self, other: Self) -> Self {
-        if let Some(value) = crate::fast_x87::binary(self, other, 2) { return value; }
+        if let Some(value) = crate::fast_x87::binary(self, other, 2) {
+            return value;
+        }
         let mut result = F80::ZERO;
         unsafe { extF80M_mul(&self, &other, &mut result) };
         result
@@ -287,7 +313,9 @@ impl std::ops::Mul for F80 {
 impl std::ops::Div for F80 {
     type Output = F80;
     fn div(self, other: Self) -> Self {
-        if let Some(value) = crate::fast_x87::binary(self, other, 3) { return value; }
+        if let Some(value) = crate::fast_x87::binary(self, other, 3) {
+            return value;
+        }
         let mut result = F80::ZERO;
         unsafe { extF80M_div(&self, &other, &mut result) };
         result

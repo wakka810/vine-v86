@@ -3269,7 +3269,8 @@ unsafe fn cycle_internal_with_budget(interpreter_budget: u32) {
 
         if is_near_end_of_page(*instruction_pointer as u32) {
             profiler::stat_increment(stat::RUN_FROM_CACHE_EXIT_NEAR_END_OF_PAGE);
-        } else if Page::page_of(initial_eip as u32) == Page::page_of(*instruction_pointer as u32) {
+        }
+        else if Page::page_of(initial_eip as u32) == Page::page_of(*instruction_pointer as u32) {
             profiler::stat_increment(stat::RUN_FROM_CACHE_EXIT_SAME_PAGE);
         }
         else {
@@ -3500,12 +3501,7 @@ pub unsafe fn vine_get_stop_error_code() -> i32 { vine_stop_error_code }
 // Same stopped context: the host only completed an API/callback return. Paging,
 // segments, flags and the rest of the architectural state remain unchanged.
 #[no_mangle]
-pub unsafe fn vine_cpu_apply_stopped_resume(
-    eax: u32,
-    write_eax: u32,
-    esp: u32,
-    eip: u32,
-) -> u32 {
+pub unsafe fn vine_cpu_apply_stopped_resume(eax: u32, write_eax: u32, esp: u32, eip: u32) -> u32 {
     if write_eax > 1 || vine_execution_active {
         return 1;
     }

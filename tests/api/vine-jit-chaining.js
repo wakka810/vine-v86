@@ -20,22 +20,22 @@ function pair(parts, options = {}) {
     for(const cpu of [chained, plain]) cpu.wasm.set_jit_config(1, 1);
     return { chained, plain, cpus: [chained, plain] };
 }
-function equalState(chained, plain, budgetExit, description) {
+function equal_state(chained, plain, budget_exit, description) {
     const { jit, interpreted, ...actual } = chained.full_snapshot();
-    const { jit: referenceJit, interpreted: referenceInterpreted, ...expected } = plain.full_snapshot();
+    const { jit: reference_jit, interpreted: reference_interpreted, ...expected } = plain.full_snapshot();
     // PREVIOUS_EIP is not architectural at a successful budget exit. At faults
     // and other stops it must still match, as must every other state word.
-    if(budgetExit) {
+    if(budget_exit) {
         actual.state = actual.state.filter((_, index) => index !== 11);
         expected.state = expected.state.filter((_, index) => index !== 11);
     }
     assert.deepEqual(actual, expected, description);
-    assert.equal(jit + interpreted, referenceJit + referenceInterpreted, description);
+    assert.equal(jit + interpreted, reference_jit + reference_interpreted, description);
 }
 function run(both, budget, description) {
     const actual = both.chained.execute(budget);
     assert.deepEqual(actual, both.plain.execute(budget), description);
-    equalState(both.chained, both.plain, actual.reason === 1, description);
+    equal_state(both.chained, both.plain, actual.reason === 1, description);
     return actual;
 }
 
@@ -100,16 +100,16 @@ for(const [name, fault, options, reason] of [
 }
 
 {
-    let activeRejections = 0;
+    let active_rejections = 0;
     const cpu = create_cpu(program(loops[2][1]), { chaining: true, asynchronous: true,
         on_finalize(wasm) {
             assert.equal(wasm.vine_set_jit_chaining(0), 1);
-            activeRejections++;
+            active_rejections++;
         },
     });
     cpu.wasm.set_jit_config(1, 1);
     for(let index = 0; index < 10; index++) { cpu.execute(131072); await Promise.resolve(); }
-    assert(activeRejections > 0 && cpu.counts.chain_entries > 0);
+    assert(active_rejections > 0 && cpu.counts.chain_entries > 0);
     const snapshot = cpu.full_snapshot();
     assert.equal(cpu.wasm.vine_set_jit_chaining(2), 1);
     assert.deepEqual(cpu.full_snapshot(), snapshot);
@@ -126,7 +126,7 @@ for(const [name, fault, options, reason] of [
 
 for(const enabled of [false, true]) {
     const queued = [];
-    const originalQueue = globalThis.queueMicrotask;
+    const original_queue = globalThis.queueMicrotask;
     const cpu = create_cpu(program(loops[2][1]), { chaining: enabled, asynchronous: true });
     const reference = create_cpu(program(loops[2][1]), { chaining: false });
     cpu.wasm.set_jit_config(1, 1);
@@ -145,7 +145,7 @@ for(const enabled of [false, true]) {
         assert.equal(cpu.wasm.vine_get_jit_chaining(), Number(!enabled));
         if(!enabled) assert(cpu.counts.chain_entries > 0);
     } finally {
-        globalThis.queueMicrotask = originalQueue;
+        globalThis.queueMicrotask = original_queue;
     }
 }
 console.log("pending compilation: both ABI mode changes reject stale finalization");

@@ -337,7 +337,8 @@ fn mmx_binary_v128(ctx: &mut JitContext, r: u32, operation: fn(&mut WasmBuilder)
     mmx_finish_write64(ctx, destination);
 }
 fn mmx_binary_reg_v128(ctx: &mut JitContext, r1: u32, r2: u32, operation: fn(&mut WasmBuilder)) {
-    ctx.builder.load_fixed_i64(global_pointers::get_reg_mmx_offset(r1));
+    ctx.builder
+        .load_fixed_i64(global_pointers::get_reg_mmx_offset(r1));
     mmx_binary_v128(ctx, r2, operation);
 }
 fn mmx_pack_unsigned_bytes(builder: &mut WasmBuilder) {
@@ -346,6 +347,42 @@ fn mmx_pack_unsigned_bytes(builder: &mut WasmBuilder) {
     builder.i8x16_shuffle([0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23]);
     builder.v128_const([0; 16]);
     builder.i8x16_narrow_i16x8_u();
+}
+fn mmx_pack_signed_words(builder: &mut WasmBuilder) {
+    builder.i8x16_shuffle([0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23]);
+    builder.v128_const([0; 16]);
+    builder.i16x8_narrow_i32x4_s();
+}
+fn mmx_multiply_high_signed_words(builder: &mut WasmBuilder) {
+    builder.extmul_low_i16x8_s();
+    builder.const_i32(16);
+    builder.shr_s_i32x4();
+    builder.v128_const([0; 16]);
+    builder.i16x8_narrow_i32x4_s();
+}
+fn mmx_shift_v128(
+    ctx: &mut JitContext,
+    r: u32,
+    count: u32,
+    width: u32,
+    operation: fn(&mut WasmBuilder),
+) {
+    let destination = global_pointers::get_reg_mmx_offset(r);
+    ctx.builder.const_i32(destination as i32);
+    // x86 logical shifts zero out oversized counts; Wasm masks its count.
+    // Arithmetic callers clamp first to preserve the sign lane.
+    if count >= width {
+        ctx.builder.const_i64(0);
+    }
+    else {
+        ctx.builder.load_fixed_i64(destination);
+        ctx.builder.splat_i64x2();
+        ctx.builder.const_i32(count as i32);
+        operation(ctx.builder);
+        ctx.builder.extract_i64x2_lane(0);
+    }
+    ctx.builder.store_aligned_i64(0);
+    mmx_finish_write64(ctx, destination);
 }
 
 fn mmx_read64_mm_mem32(ctx: &mut JitContext, name: &str, modrm_byte: ModrmByte, r: u32) {
@@ -6539,10 +6576,11 @@ pub fn instr_0F6A_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     mmx_read64_mm_mm(ctx, "instr_0F6A", r1, r2);
 }
 pub fn instr_0F6B_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    mmx_read64_mm_mem(ctx, "instr_0F6B", modrm_byte, r);
+    codegen::gen_modrm_resolve_safe_read64(ctx, modrm_byte);
+    mmx_binary_v128(ctx, r, mmx_pack_signed_words);
 }
 pub fn instr_0F6B_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    mmx_read64_mm_mm(ctx, "instr_0F6B", r1, r2);
+    mmx_binary_reg_v128(ctx, r1, r2, mmx_pack_signed_words);
 }
 
 pub fn instr_660F60_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
@@ -6843,31 +6881,19 @@ pub fn instr_0F71_2_mem_jit(ctx: &mut JitContext, _modrm_byte: ModrmByte, _imm: 
     codegen::gen_trigger_ud(ctx);
 }
 pub fn instr_0F71_2_reg_jit(ctx: &mut JitContext, r: u32, imm8: u32) {
-    ctx.builder.const_i32(r as i32);
-    ctx.builder.const_i32(imm8 as i32);
-    ctx.builder.call_fn2("instr_0F71_2_reg");
+    mmx_shift_v128(ctx, r, imm8, 16, WasmBuilder::shr_u_i16x8);
 }
 pub fn instr_0F71_4_mem_jit(ctx: &mut JitContext, _modrm_byte: ModrmByte, _imm: u32) {
     codegen::gen_trigger_ud(ctx);
 }
 pub fn instr_0F71_4_reg_jit(ctx: &mut JitContext, r: u32, imm8: u32) {
-    let destination = global_pointers::get_reg_mmx_offset(r);
-    ctx.builder.const_i32(destination as i32);
-    ctx.builder.load_fixed_i64(destination);
-    ctx.builder.splat_i64x2();
-    ctx.builder.const_i32(imm8.min(15) as i32);
-    ctx.builder.shr_s_i16x8();
-    ctx.builder.extract_i64x2_lane(0);
-    ctx.builder.store_aligned_i64(0);
-    mmx_finish_write64(ctx, destination);
+    mmx_shift_v128(ctx, r, imm8.min(15), 16, WasmBuilder::shr_s_i16x8);
 }
 pub fn instr_0F71_6_mem_jit(ctx: &mut JitContext, _modrm_byte: ModrmByte, _imm: u32) {
     codegen::gen_trigger_ud(ctx);
 }
 pub fn instr_0F71_6_reg_jit(ctx: &mut JitContext, r: u32, imm8: u32) {
-    ctx.builder.const_i32(r as i32);
-    ctx.builder.const_i32(imm8 as i32);
-    ctx.builder.call_fn2("instr_0F71_6_reg");
+    mmx_shift_v128(ctx, r, imm8, 16, WasmBuilder::shl_i16x8);
 }
 
 pub fn instr_0F72_2_mem_jit(ctx: &mut JitContext, _modrm_byte: ModrmByte, _imm: u32) {
@@ -6882,9 +6908,7 @@ pub fn instr_0F72_4_mem_jit(ctx: &mut JitContext, _modrm_byte: ModrmByte, _imm: 
     codegen::gen_trigger_ud(ctx);
 }
 pub fn instr_0F72_4_reg_jit(ctx: &mut JitContext, r: u32, imm8: u32) {
-    ctx.builder.const_i32(r as i32);
-    ctx.builder.const_i32(imm8 as i32);
-    ctx.builder.call_fn2("instr_0F72_4_reg");
+    mmx_shift_v128(ctx, r, imm8.min(31), 32, WasmBuilder::shr_s_i32x4);
 }
 pub fn instr_0F72_6_mem_jit(ctx: &mut JitContext, _modrm_byte: ModrmByte, _imm: u32) {
     codegen::gen_trigger_ud(ctx);
@@ -7074,7 +7098,8 @@ pub fn instr_F20F7D_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 pub fn instr_0F7E_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     codegen::gen_modrm_resolve(ctx, modrm_byte);
     let address_local = ctx.builder.set_new_local();
-    ctx.builder.load_fixed_i32(global_pointers::get_reg_mmx_offset(r));
+    ctx.builder
+        .load_fixed_i32(global_pointers::get_reg_mmx_offset(r));
     let value_local = ctx.builder.set_new_local();
     codegen::gen_safe_write32(ctx, &address_local, &value_local);
     ctx.builder.free_local(address_local);
@@ -7082,7 +7107,8 @@ pub fn instr_0F7E_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     mmx_transition(ctx);
 }
 pub fn instr_0F7E_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    ctx.builder.load_fixed_i32(global_pointers::get_reg_mmx_offset(r2));
+    ctx.builder
+        .load_fixed_i32(global_pointers::get_reg_mmx_offset(r2));
     codegen::gen_set_reg32(ctx, r1);
     mmx_transition(ctx);
 }
@@ -7549,10 +7575,11 @@ pub fn instr_0FDA_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     mmx_read64_mm_mm(ctx, "instr_0FDA", r1, r2);
 }
 pub fn instr_0FDB_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    mmx_read64_mm_mem(ctx, "instr_0FDB", modrm_byte, r);
+    codegen::gen_modrm_resolve_safe_read64(ctx, modrm_byte);
+    mmx_binary_v128(ctx, r, WasmBuilder::and_v128);
 }
 pub fn instr_0FDB_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    mmx_read64_mm_mm(ctx, "instr_0FDB", r1, r2);
+    mmx_binary_reg_v128(ctx, r1, r2, WasmBuilder::and_v128);
 }
 pub fn instr_0FDC_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     mmx_read64_mm_mem(ctx, "instr_0FDC", modrm_byte, r);
@@ -7761,10 +7788,11 @@ pub fn instr_0FE4_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     mmx_read64_mm_mm(ctx, "instr_0FE4", r1, r2);
 }
 pub fn instr_0FE5_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    mmx_read64_mm_mem(ctx, "instr_0FE5", modrm_byte, r);
+    codegen::gen_modrm_resolve_safe_read64(ctx, modrm_byte);
+    mmx_binary_v128(ctx, r, mmx_multiply_high_signed_words);
 }
 pub fn instr_0FE5_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    mmx_read64_mm_mm(ctx, "instr_0FE5", r1, r2);
+    mmx_binary_reg_v128(ctx, r1, r2, mmx_multiply_high_signed_words);
 }
 
 pub fn instr_0FE8_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
@@ -7810,10 +7838,11 @@ pub fn instr_0FEE_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     mmx_read64_mm_mm(ctx, "instr_0FEE", r1, r2);
 }
 pub fn instr_0FEF_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    mmx_read64_mm_mem(ctx, "instr_0FEF", modrm_byte, r);
+    codegen::gen_modrm_resolve_safe_read64(ctx, modrm_byte);
+    mmx_binary_v128(ctx, r, WasmBuilder::xor_v128);
 }
 pub fn instr_0FEF_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    mmx_read64_mm_mm(ctx, "instr_0FEF", r1, r2);
+    mmx_binary_reg_v128(ctx, r1, r2, WasmBuilder::xor_v128);
 }
 
 pub fn instr_660FE0_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
@@ -7953,10 +7982,11 @@ pub fn instr_0FF4_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     mmx_read64_mm_mm(ctx, "instr_0FF4", r1, r2);
 }
 pub fn instr_0FF5_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    mmx_read64_mm_mem(ctx, "instr_0FF5", modrm_byte, r);
+    codegen::gen_modrm_resolve_safe_read64(ctx, modrm_byte);
+    mmx_binary_v128(ctx, r, WasmBuilder::dot_i16x8_s);
 }
 pub fn instr_0FF5_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    mmx_read64_mm_mm(ctx, "instr_0FF5", r1, r2);
+    mmx_binary_reg_v128(ctx, r1, r2, WasmBuilder::dot_i16x8_s);
 }
 pub fn instr_0FF6_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     mmx_read64_mm_mem(ctx, "instr_0FF6", modrm_byte, r);
@@ -8024,10 +8054,11 @@ pub fn instr_0FFD_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     mmx_binary_reg_v128(ctx, r1, r2, WasmBuilder::add_i16x8);
 }
 pub fn instr_0FFE_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    mmx_read64_mm_mem(ctx, "instr_0FFE", modrm_byte, r);
+    codegen::gen_modrm_resolve_safe_read64(ctx, modrm_byte);
+    mmx_binary_v128(ctx, r, WasmBuilder::add_i32x4);
 }
 pub fn instr_0FFE_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    mmx_read64_mm_mm(ctx, "instr_0FFE", r1, r2);
+    mmx_binary_reg_v128(ctx, r1, r2, WasmBuilder::add_i32x4);
 }
 
 pub fn instr_660FF1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {

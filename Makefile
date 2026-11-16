@@ -379,6 +379,9 @@ vine-jit-affine-ram-test: build/v86-fallback.wasm
 vine-x87-performance-test: build/v86-fallback.wasm
 	node tests/api/vine-x87-performance.js
 
+vine-mmx-simd-test: build/v86-fallback.wasm
+	node tests/api/vine-mmx-simd.js
+
 api-tests: build/v86-debug.wasm
 	./tests/api/clean-shutdown.js
 	./tests/api/state.js

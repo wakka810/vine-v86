@@ -34,9 +34,15 @@ static mut ALLOCATED_MEMORY_SIZE: u32 = 0;
 /// Called by the unified Rust linker crate with the live Runtime descriptor,
 /// before the CPU is initialized. This memory must never be reallocated by v86.
 pub unsafe fn bind_runtime_memory(base: u32, size: u32) -> bool {
-    if cpu::vine_execution_is_active() || !mem8.is_null() || base == 0
-        || base & 4095 != 0 || size & 4095 != 0
-        || u64::from(base) + u64::from(size) > 0x1_0000_0000 { return false; }
+    if cpu::vine_execution_is_active()
+        || !mem8.is_null()
+        || base == 0
+        || base & 4095 != 0
+        || size & 4095 != 0
+        || u64::from(base) + u64::from(size) > 0x1_0000_0000
+    {
+        return false;
+    }
     mem8 = base as *mut u8;
     *memory_size = size;
     ALLOCATED_MEMORY_SIZE = 0;
@@ -74,7 +80,8 @@ pub unsafe fn vine_grow_memory(expected_base: u32, expected_size: u32, size: u32
     {
         return 0;
     }
-    let Ok(layout) = alloc::Layout::from_size_align(expected_size as usize, 0x1000) else {
+    let Ok(layout) = alloc::Layout::from_size_align(expected_size as usize, 0x1000)
+    else {
         return 0;
     };
     let next = alloc::realloc(mem8, layout, size as usize);

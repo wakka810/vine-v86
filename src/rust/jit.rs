@@ -68,7 +68,9 @@ pub unsafe fn vine_get_jit_chaining() -> u32 { VINE_JIT_CHAINING as u32 }
 
 #[no_mangle]
 pub unsafe fn vine_set_jit_chaining(enabled: u32) -> u32 {
-    if enabled > 1 || cpu::vine_execution_is_active() { return 1; }
+    if enabled > 1 || cpu::vine_execution_is_active() {
+        return 1;
+    }
     if VINE_JIT_CHAINING != (enabled != 0) {
         // Every cached target must have the same native entry ABI. This also
         // cancels a compilation whose old-format finalizer is still queued.
@@ -139,7 +141,10 @@ struct PageInfo {
 }
 
 enum CompilingPageState {
-    Compiling { pages: HashMap<Page, PageInfo>, copied_pages: HashSet<Page> },
+    Compiling {
+        pages: HashMap<Page, PageInfo>,
+        copied_pages: HashSet<Page>,
+    },
     CompilingWritten,
 }
 
@@ -454,8 +459,13 @@ fn jit_find_basic_blocks(
     // Copy only a short straight-line callee. The source page keeps its public
     // entry map; this module depends on its bytes without taking it over.
     fn short_leaf(phys_target: u32, cpu: &CpuContext) -> bool {
-        if !cpu.state_flags.is_32() { return false; }
-        let mut leaf = CpuContext { eip: phys_target, ..cpu.clone() };
+        if !cpu.state_flags.is_32() {
+            return false;
+        }
+        let mut leaf = CpuContext {
+            eip: phys_target,
+            ..cpu.clone()
+        };
         for _ in 0..16 {
             if is_near_end_of_page(leaf.eip) || leaf.eip - phys_target >= 128 {
                 return false;
@@ -463,7 +473,8 @@ fn jit_find_basic_blocks(
             let opcode = memory::read8(leaf.eip);
             let analysis = analysis::analyze_step(&mut leaf);
             if (opcode == 0xC3 || opcode == 0xC2)
-                && analysis.ty == AnalysisType::BlockBoundary && analysis.absolute_jump
+                && analysis.ty == AnalysisType::BlockBoundary
+                && analysis.absolute_jump
             {
                 return true;
             }
@@ -506,14 +517,18 @@ fn jit_find_basic_blocks(
         }
 
         if copied_pages.contains(&phys_page) {
-            if !target_only || !short_leaf(phys_target, cpu) { return None; }
+            if !target_only || !short_leaf(phys_target, cpu) {
+                return None;
+            }
             to_visit_stack.push(virt_target);
             return Some(phys_target);
         }
 
         if !pages.contains(&phys_page) {
             if target_only && ctx.pages.contains_key(&phys_page) {
-                if !short_leaf(phys_target, cpu) { return None; }
+                if !short_leaf(phys_target, cpu) {
+                    return None;
+                }
                 pages.insert(phys_page);
                 copied_pages.insert(phys_page);
                 to_visit_stack.push(virt_target);
@@ -531,7 +546,9 @@ fn jit_find_basic_blocks(
             };
             if let Some((hotness, entry_points)) = ctx.entry_points.get_mut(&phys_page) {
                 if !target_only
-                    && entry_points.iter().all(|entry| required_entries.contains(entry))
+                    && entry_points
+                        .iter()
+                        .all(|entry| required_entries.contains(entry))
                 {
                     page_blacklist.insert(phys_page);
                     return None;
@@ -1128,7 +1145,10 @@ fn jit_analyze_and_generate(
     dbg_assert!(ctx.compiling.is_none());
     ctx.compiling = Some((
         wasm_table_index,
-        CompilingPageState::Compiling { pages: page_info, copied_pages },
+        CompilingPageState::Compiling {
+            pages: page_info,
+            copied_pages,
+        },
     ));
 
     let phys_addr = page.to_address();
@@ -1173,7 +1193,13 @@ pub fn codegen_finalize_finished(
             check_jit_state_invariants(&mut ctx);
             return;
         },
-        Some((in_progress_wasm_table_index, CompilingPageState::Compiling { pages, copied_pages })) => {
+        Some((
+            in_progress_wasm_table_index,
+            CompilingPageState::Compiling {
+                pages,
+                copied_pages,
+            },
+        )) => {
             dbg_assert!(wasm_table_index == in_progress_wasm_table_index);
             dbg_assert!(!pages.is_empty());
             (pages, copied_pages)
@@ -1188,7 +1214,9 @@ pub fn codegen_finalize_finished(
                 (entry as u32 >> 12 ^ page as u32) - (unsafe { memory::mem8 } as u32 >> 12),
             );
             if let Some(info) = pages.get(&tlb_physical_page) {
-                if copied_pages.contains(&tlb_physical_page) { continue; }
+                if copied_pages.contains(&tlb_physical_page) {
+                    continue;
+                }
                 set_tlb_code(
                     Page::of_u32(page as u32),
                     wasm_table_index,
@@ -1309,33 +1337,49 @@ fn jit_generate_module(
 
     if unsafe { VINE_JIT_CHAINING } {
         builder.get_argument(0);
-        for i in 0..8 { builder.load_fixed_i32(global_pointers::get_reg32_offset(i)); }
+        for i in 0..8 {
+            builder.load_fixed_i32(global_pointers::get_reg32_offset(i));
+        }
         builder.const_i32(0);
         if unsafe { cpu::vine_jit_exact_instruction_budget } {
             builder.call_fn0_ret("vine_jit_instruction_limit");
         }
-        else { builder.const_i32(-1); }
+        else {
+            builder.const_i32(-1);
+        }
         builder.prepare_chain_entry();
     }
 
     let mut register_locals = (0..8)
         .map(|i| {
-            if builder.is_chained() { builder.get_argument(i as u8 + 1); }
-            else { builder.load_fixed_i32(global_pointers::get_reg32_offset(i)); }
+            if builder.is_chained() {
+                builder.get_argument(i as u8 + 1);
+            }
+            else {
+                builder.load_fixed_i32(global_pointers::get_reg32_offset(i));
+            }
             builder.set_new_local()
         })
         .collect();
 
-    if builder.is_chained() { builder.get_argument(9); }
-    else { builder.const_i32(0); }
+    if builder.is_chained() {
+        builder.get_argument(9);
+    }
+    else {
+        builder.const_i32(0);
+    }
     let instruction_counter = builder.set_new_local();
 
     // cycle_internal_with_budget sets the limit before this synchronous invocation
     // and resets it after we return. Dispatch, helpers, and cache invalidation do
     // not change it, so every block can use the same invocation-local snapshot.
     let instruction_limit = if unsafe { cpu::vine_jit_exact_instruction_budget } {
-        if builder.is_chained() { builder.get_argument(10); }
-        else { builder.call_fn0_ret("vine_jit_instruction_limit"); }
+        if builder.is_chained() {
+            builder.get_argument(10);
+        }
+        else {
+            builder.call_fn0_ret("vine_jit_instruction_limit");
+        }
         let limit = builder.set_new_local();
         if unsafe { JIT_USE_LOOP_SAFETY } {
             // Every block already checks its entire charge against this limit.
@@ -1440,14 +1484,34 @@ fn jit_generate_module(
     let mut leaf_returns: HashMap<u32, Vec<(i32, u32, u16)>> = HashMap::new();
     if ctx.cpu.state_flags.is_32() {
         for caller in basic_blocks.values() {
-            if memory::read8(caller.last_instruction_addr) != 0xe8 { continue; }
-            let BasicBlockType::Normal { next_block_addr: Some(target), jump_offset_is_32: true, .. } = caller.ty else { continue; };
-            let Some(leaf) = basic_blocks.get(&target) else { continue; };
-            if !matches!(leaf.ty, BasicBlockType::AbsoluteEip) || leaf.number_of_instructions > 16
+            if memory::read8(caller.last_instruction_addr) != 0xe8 {
+                continue;
+            }
+            let BasicBlockType::Normal {
+                next_block_addr: Some(target),
+                jump_offset_is_32: true,
+                ..
+            } = caller.ty
+            else {
+                continue;
+            };
+            let Some(leaf) = basic_blocks.get(&target)
+            else {
+                continue;
+            };
+            if !matches!(leaf.ty, BasicBlockType::AbsoluteEip)
+                || leaf.number_of_instructions > 16
                 || !matches!(memory::read8(leaf.last_instruction_addr), 0xc2 | 0xc3)
-                || !entry_blocks.contains(&caller.end_addr) { continue; }
+                || !entry_blocks.contains(&caller.end_addr)
+            {
+                continue;
+            }
             let address = caller.virt_addr & !0xfff | caller.end_addr as i32 & 0xfff;
-            leaf_returns.entry(leaf.addr).or_default().push((address, caller.end_addr, index_for_addr[&caller.end_addr]));
+            leaf_returns.entry(leaf.addr).or_default().push((
+                address,
+                caller.end_addr,
+                index_for_addr[&caller.end_addr],
+            ));
         }
     }
 
@@ -1542,13 +1606,23 @@ fn jit_generate_module(
                         ctx.builder.br(ctx.exit_label);
                     },
                     BasicBlockType::AbsoluteEip => {
-                        if let Some(returns) = leaf_returns.get(&block.addr).filter(|r| r.len() <= 2) {
+                        if let Some(returns) =
+                            leaf_returns.get(&block.addr).filter(|r| r.len() <= 2)
+                        {
                             for &(address, physical, index) in returns {
                                 codegen::gen_get_eip(ctx.builder);
-                                ctx.builder.const_i32(address); ctx.builder.eq_i32(); ctx.builder.if_void();
-                                codegen::gen_page_switch_check(ctx, physical, block.last_instruction_addr);
-                                ctx.builder.const_i32(index as i32); ctx.builder.set_local(target_block);
-                                ctx.builder.br(main_loop_label); ctx.builder.block_end();
+                                ctx.builder.const_i32(address);
+                                ctx.builder.eq_i32();
+                                ctx.builder.if_void();
+                                codegen::gen_page_switch_check(
+                                    ctx,
+                                    physical,
+                                    block.last_instruction_addr,
+                                );
+                                ctx.builder.const_i32(index as i32);
+                                ctx.builder.set_local(target_block);
+                                ctx.builder.br(main_loop_label);
+                                ctx.builder.block_end();
                             }
                         }
                         // Check if we can stay in this module, if not exit
@@ -2265,7 +2339,9 @@ fn jit_generate_module(
 }
 
 fn gen_chain_to_cached_entry(ctx: &mut JitContext, state_flags: CachedStateFlags) {
-    if !ctx.builder.is_chained() { return; }
+    if !ctx.builder.is_chained() {
+        return;
+    }
     // No page walk or fallible helper is allowed between resolving this live
     // TLB code identity and jumping to it. Misses retain the CPU dispatcher.
     let fallback = ctx.builder.block_void();
@@ -2275,12 +2351,14 @@ fn gen_chain_to_cached_entry(ctx: &mut JitContext, state_flags: CachedStateFlags
     ctx.builder.shr_u_i32();
     ctx.builder.const_i32(2);
     ctx.builder.shl_i32();
-    ctx.builder.load_aligned_i32((&raw const cpu::tlb_code) as u32);
+    ctx.builder
+        .load_aligned_i32((&raw const cpu::tlb_code) as u32);
     let code = ctx.builder.tee_new_local();
     ctx.builder.eqz_i32();
     ctx.builder.br_if(fallback);
     ctx.builder.get_local(&code);
-    ctx.builder.load_u8(std::mem::offset_of!(cpu::Code, state_flags) as u32);
+    ctx.builder
+        .load_u8(std::mem::offset_of!(cpu::Code, state_flags) as u32);
     ctx.builder.const_i32(state_flags.to_u32() as i32);
     ctx.builder.ne_i32();
     ctx.builder.br_if(fallback);
@@ -2291,20 +2369,29 @@ fn gen_chain_to_cached_entry(ctx: &mut JitContext, state_flags: CachedStateFlags
     ctx.builder.const_i32(1);
     ctx.builder.shl_i32();
     ctx.builder.add_i32();
-    ctx.builder.load_aligned_u16(std::mem::offset_of!(cpu::Code, state_table) as u32);
+    ctx.builder
+        .load_aligned_u16(std::mem::offset_of!(cpu::Code, state_table) as u32);
     let state = ctx.builder.tee_new_local();
     ctx.builder.const_i32(u16::MAX as i32);
     ctx.builder.eq_i32();
     ctx.builder.br_if(fallback);
 
     ctx.builder.get_local(&state);
-    for register in ctx.register_locals.iter() { ctx.builder.get_local(register); }
+    for register in ctx.register_locals.iter() {
+        ctx.builder.get_local(register);
+    }
     ctx.builder.get_local(&ctx.instruction_counter);
-    if let Some(limit) = &ctx.instruction_limit { ctx.builder.get_local(limit); }
-    else { ctx.builder.const_i32(-1); }
+    if let Some(limit) = &ctx.instruction_limit {
+        ctx.builder.get_local(limit);
+    }
+    else {
+        ctx.builder.const_i32(-1);
+    }
     ctx.builder.get_local(&code);
-    ctx.builder.load_aligned_u16(std::mem::offset_of!(cpu::Code, wasm_table_index) as u32);
-    ctx.builder.const_i32((cpu::WASM_TABLE_OFFSET + WASM_TABLE_SIZE) as i32);
+    ctx.builder
+        .load_aligned_u16(std::mem::offset_of!(cpu::Code, wasm_table_index) as u32);
+    ctx.builder
+        .const_i32((cpu::WASM_TABLE_OFFSET + WASM_TABLE_SIZE) as i32);
     ctx.builder.add_i32();
     ctx.builder.return_call_chain();
     ctx.builder.block_end();
@@ -2357,11 +2444,15 @@ fn jit_generate_basic_block(ctx: &mut JitContext, block: &BasicBlock) {
 
     loop {
         if crate::jit_fast_x87::generate(ctx, block) {
-            if ctx.cpu.eip == stop_addr { break; }
+            if ctx.cpu.eip == stop_addr {
+                break;
+            }
             continue;
         }
         if crate::jit_fast_memory::generate(ctx, block) {
-            if ctx.cpu.eip == stop_addr { break; }
+            if ctx.cpu.eip == stop_addr {
+                break;
+            }
             continue;
         }
         let mut instruction = 0;

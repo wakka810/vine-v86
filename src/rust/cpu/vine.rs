@@ -73,7 +73,12 @@ pub unsafe fn set_common_memory(base: u32, permissions: u32) {
 }
 
 pub unsafe fn common_memory() -> Option<(u32, u32)> {
-    if COMMON_FASTMEM { COMMON_MEMORY } else { None }
+    if COMMON_FASTMEM {
+        COMMON_MEMORY
+    }
+    else {
+        None
+    }
 }
 
 pub unsafe fn invalidate_common_page(page: Option<u32>) {
@@ -89,7 +94,9 @@ pub unsafe fn invalidate_common_page(page: Option<u32>) {
 
 #[no_mangle]
 pub unsafe fn vine_set_common_fastmem(enabled: u32) -> u32 {
-    if enabled > 1 || crate::cpu::cpu::vine_execution_is_active() { return 1; }
+    if enabled > 1 || crate::cpu::cpu::vine_execution_is_active() {
+        return 1;
+    }
     if COMMON_FASTMEM != (enabled != 0) {
         crate::jit::jit_clear_cache_js();
         COMMON_FASTMEM = enabled != 0;
@@ -156,7 +163,9 @@ pub unsafe fn execute_fetch_allowed(address: u32) -> bool {
 
 #[inline]
 pub unsafe fn mark_guest_page_dirty(address: u32) {
-    if matches!(COMMON_MEMORY, Some(_)) { return; }
+    if matches!(COMMON_MEMORY, Some(_)) {
+        return;
+    }
     let page = address >> X86_PAGE_SHIFT;
     let byte_index = (page >> 3) as usize;
     let mask = 1 << (page & 7);
