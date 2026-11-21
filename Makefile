@@ -344,7 +344,7 @@ kvm-unit-test-release: build/libv86.mjs build/v86.wasm
 	TEST_RELEASE_BUILD=1 tests/kvm-unit-tests/run.mjs tests/kvm-unit-tests/x86/taskswitch2.flat
 	TEST_RELEASE_BUILD=1 tests/kvm-unit-tests/run.mjs tests/kvm-unit-tests/x86/realmode.flat
 
-expect-tests: build/v86-debug.wasm build/libwabt.cjs
+expect-tests: build/v86-debug.wasm build/libwabt-1.0.39.cjs
 	make -C tests/expect/tests
 	./tests/expect/run.js
 
@@ -413,6 +413,16 @@ build/libwabt.cjs:
 	unzip -j -d build/ build/1.0.6.zip wabt-1.0.6/demo/libwabt.js
 	mv build/libwabt.js build/libwabt.cjs
 	rm build/1.0.6.zip
+
+# Newer wabt used only by the expect-test disassembler: the JIT output uses
+# v128 locals and final-spec SIMD opcodes, which the bundled 1.0.6 demo
+# (draft-SIMD numbering, still used by debug.html/cpu.js) cannot parse.
+build/libwabt-1.0.39.cjs:
+	mkdir -p build
+	set -e; tmp=$$(mktemp "$@.XXXXXX"); trap 'rm -f "$$tmp" "$$tmp.tgz"' EXIT; \
+	    wget -nv -O "$$tmp.tgz" https://registry.npmjs.org/wabt/-/wabt-1.0.39.tgz; \
+	    tar -xOzf "$$tmp.tgz" package/index.js > "$$tmp"; \
+	    chmod 644 "$$tmp"; mv "$$tmp" "$@"
 
 build/xterm.js:
 	curl https://cdn.jsdelivr.net/npm/xterm@5.2.1/lib/xterm.min.js > build/xterm.js

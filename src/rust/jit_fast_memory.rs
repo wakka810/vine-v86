@@ -3,6 +3,7 @@
 use crate::cpu::cpu;
 use crate::cpu_context::CpuContext;
 use crate::jit::{BasicBlock, BasicBlockType, Instruction, JitContext};
+use crate::regs;
 use crate::wasmgen::wasm_builder::{Label, WasmLocal};
 use crate::{codegen, jit_instructions, modrm};
 
@@ -47,23 +48,73 @@ enum Op {
     Load(u32, Address),
     Store(u32, Address),
     StoreImm(i32, Address),
+    Load8(u32, Address),
+    Store8(u32, Address),
+    LoadZx8(u32, Address),
+    LoadZx16(u32, Address),
+    PushReg(u32, Address),
+    PushImm(i32, Address),
+    PopReg(u32, Address),
     Integer,
 }
 impl Op {
-    fn memory(self) -> Option<(Address, bool)> {
+    fn memory(self) -> Option<(Address, bool, u32)> {
         match self {
-            Self::Load(_, a) => Some((a, false)),
-            Self::Store(_, a) | Self::StoreImm(_, a) => Some((a, true)),
+            Self::Load(_, a) | Self::PopReg(_, a) => Some((a, false, 4)),
+            Self::Store(_, a)
+            | Self::StoreImm(_, a)
+            | Self::PushReg(_, a)
+            | Self::PushImm(_, a) => Some((a, true, 4)),
+            Self::Load8(_, a) | Self::LoadZx8(_, a) => Some((a, false, 1)),
+            Self::Store8(_, a) => Some((a, true, 1)),
+            Self::LoadZx16(_, a) => Some((a, false, 2)),
             Self::Integer => None,
         }
     }
 }
-fn decode(c: &mut CpuContext, registers: &mut [Option<Address>; 8]) -> Option<Op> {
+fn decode(c: &mut CpuContext, registers: &mut [Option<Address>; 8], ssize_32: bool) -> Option<Op> {
     if c.eip & 0xfff >= 0xff0 {
         return None;
     }
     let opcode = c.read_imm8();
     match opcode {
+        0x50..=0x57 if ssize_32 => {
+            let r = (opcode & 7) as u32;
+            let a = registers[regs::ESP as usize]?.add_scaled(Address::constant(-4), 1);
+            registers[regs::ESP as usize] = Some(a);
+            return Some(Op::PushReg(r, a));
+        },
+        0x58..=0x5f if ssize_32 => {
+            let r = (opcode & 7) as u32;
+            if r == regs::ESP {
+                return None;
+            }
+            let a = registers[regs::ESP as usize]?;
+            registers[regs::ESP as usize] = Some(a.add_scaled(Address::constant(4), 1));
+            registers[r as usize] = None;
+            return Some(Op::PopReg(r, a));
+        },
+        0x68 | 0x6a if ssize_32 => {
+            let imm = if opcode == 0x6a { c.read_imm8s() as i32 } else { c.read_imm32() as i32 };
+            let a = registers[regs::ESP as usize]?.add_scaled(Address::constant(-4), 1);
+            registers[regs::ESP as usize] = Some(a);
+            return Some(Op::PushImm(imm, a));
+        },
+        0x88 | 0x8a => {
+            let byte = c.read_imm8();
+            let r = (byte >> 3 & 7) as u32;
+            if byte < 0xc0 {
+                let a = address(c, byte, registers)?;
+                if opcode == 0x8a {
+                    registers[(r & 3) as usize] = None;
+                    return Some(Op::Load8(r, a));
+                }
+                return Some(Op::Store8(r, a));
+            }
+            let rm = (byte & 7) as u32;
+            let dest = if opcode == 0x88 { rm } else { r };
+            registers[(dest & 3) as usize] = None;
+        },
         0x89 | 0x8b => {
             let byte = c.read_imm8();
             let r = (byte >> 3 & 7) as u32;
@@ -82,6 +133,36 @@ fn decode(c: &mut CpuContext, registers: &mut [Option<Address>; 8]) -> Option<Op
             else {
                 registers[r as usize] = registers[rm];
             }
+        },
+        0x0f => {
+            let op2 = c.read_imm8();
+            match op2 {
+                0xb6 | 0xb7 => {
+                    let byte = c.read_imm8();
+                    let r = (byte >> 3 & 7) as u32;
+                    if byte < 0xc0 {
+                        let a = address(c, byte, registers)?;
+                        registers[r as usize] = None;
+                        return Some(if op2 == 0xb6 {
+                            Op::LoadZx8(r, a)
+                        }
+                        else {
+                            Op::LoadZx16(r, a)
+                        });
+                    }
+                    registers[r as usize] = None;
+                },
+                _ => return None,
+            }
+        },
+        0x31 | 0x33 => {
+            let byte = c.read_imm8();
+            if byte < 0xc0 {
+                return None;
+            }
+            let (rm, r) = ((byte & 7) as usize, (byte >> 3 & 7) as usize);
+            let dest = if opcode == 0x31 { rm } else { r };
+            registers[dest] = if rm == r { Some(Address::constant(0)) } else { None };
         },
         0xc7 => {
             let byte = c.read_imm8();
@@ -160,7 +241,9 @@ fn scan(cpu: &CpuContext, block: &BasicBlock) -> Option<Run> {
     if !cpu.state_flags.is_32() || !cpu.has_flat_segmentation() {
         return None;
     }
-    let limit = if matches!(block.ty, BasicBlockType::Normal { .. }) {
+    let ssize_32 = cpu.ssize_32();
+    let limit = if matches!(block.ty, BasicBlockType::Normal { .. }) && block.inlined_call.is_none()
+    {
         block.end_addr
     }
     else {
@@ -178,20 +261,20 @@ fn scan(cpu: &CpuContext, block: &BasicBlock) -> Option<Run> {
         }
         let mut next = c.clone();
         let mut regs = registers;
-        let Some(op) = decode(&mut next, &mut regs)
+        let Some(op) = decode(&mut next, &mut regs, ssize_32)
         else {
             break;
         };
         if next.eip > limit || next.eip >> 12 != cpu.eip >> 12 {
             break;
         }
-        if let Some((a, write)) = op.memory() {
+        if let Some((a, write, width)) = op.memory() {
             if let Some(p) = &mut run {
                 if p.base.coefficients != a.coefficients {
                     break;
                 }
                 let low = p.base.offset.min(a.offset);
-                let next_high = high.max(a.offset as i64 + 4);
+                let next_high = high.max(a.offset as i64 + width as i64);
                 if next_high - low as i64 > 4096 {
                     break;
                 }
@@ -201,11 +284,11 @@ fn scan(cpu: &CpuContext, block: &BasicBlock) -> Option<Run> {
                 p.bytes = (high - low as i64) as u32;
             }
             else {
-                high = a.offset as i64 + 4;
+                high = a.offset as i64 + width as i64;
                 run = Some(Run {
                     ops: Vec::new(),
                     base: a,
-                    bytes: 4,
+                    bytes: width,
                     write,
                     end: next.eip,
                 });
@@ -224,7 +307,12 @@ fn scan(cpu: &CpuContext, block: &BasicBlock) -> Option<Run> {
     if accesses < 2 {
         return None;
     }
-    run
+    let mut run = run?;
+    while matches!(run.ops.last(), Some((_, _, Op::Integer))) {
+        run.ops.pop();
+    }
+    run.end = run.ops.last()?.1;
+    Some(run)
 }
 fn guarded_base(ctx: &mut JitContext, p: &Run, fail: Label) -> WasmLocal {
     ctx.builder.const_i32(p.base.offset);
@@ -303,9 +391,13 @@ pub fn generate(ctx: &mut JitContext, block: &BasicBlock) -> bool {
         return false;
     }
     let saved_cpu = ctx.cpu.clone();
+    let saved_stop_addr = ctx.block_stop_addr;
+    let saved_guarded = ctx.in_guarded_mem_run;
     let done = ctx.builder.block_void();
     let fail = ctx.builder.block_void();
     let base = guarded_base(ctx, &p, fail);
+    ctx.block_stop_addr = p.end;
+    ctx.in_guarded_mem_run = true;
     ctx.previous_instruction = Instruction::Other;
     ctx.current_instruction = Instruction::Other;
     for &(pc, end, op) in &p.ops {
@@ -318,18 +410,100 @@ pub fn generate(ctx: &mut JitContext, block: &BasicBlock) -> bool {
                 ctx.builder
                     .load_unaligned_i32((a.offset as i64 - p.base.offset as i64) as u32);
                 codegen::gen_set_reg32(ctx, r);
+                ctx.current_instruction = Instruction::Preserve {
+                    clobbered_reg: Some(r),
+                };
             },
             Op::Store(r, a) => {
                 ctx.builder.get_local(&base);
                 codegen::gen_get_reg32(ctx, r);
                 ctx.builder
                     .store_unaligned_i32((a.offset as i64 - p.base.offset as i64) as u32);
+                ctx.current_instruction = Instruction::Preserve {
+                    clobbered_reg: None,
+                };
             },
             Op::StoreImm(value, a) => {
                 ctx.builder.get_local(&base);
                 ctx.builder.const_i32(value);
                 ctx.builder
                     .store_unaligned_i32((a.offset as i64 - p.base.offset as i64) as u32);
+                ctx.current_instruction = Instruction::Preserve {
+                    clobbered_reg: None,
+                };
+            },
+            Op::Load8(r, a) => {
+                ctx.builder.get_local(&base);
+                ctx.builder
+                    .load_u8((a.offset as i64 - p.base.offset as i64) as u32);
+                codegen::gen_set_reg8_unmasked(ctx, r);
+                ctx.current_instruction = Instruction::Preserve {
+                    clobbered_reg: Some(r & 3),
+                };
+            },
+            Op::Store8(r, a) => {
+                ctx.builder.get_local(&base);
+                codegen::gen_get_reg8(ctx, r);
+                ctx.builder
+                    .store_u8((a.offset as i64 - p.base.offset as i64) as u32);
+                ctx.current_instruction = Instruction::Preserve {
+                    clobbered_reg: None,
+                };
+            },
+            Op::LoadZx8(r, a) => {
+                ctx.builder.get_local(&base);
+                ctx.builder
+                    .load_u8((a.offset as i64 - p.base.offset as i64) as u32);
+                codegen::gen_set_reg32(ctx, r);
+                ctx.current_instruction = Instruction::Preserve {
+                    clobbered_reg: Some(r),
+                };
+            },
+            Op::LoadZx16(r, a) => {
+                ctx.builder.get_local(&base);
+                ctx.builder
+                    .load_unaligned_u16((a.offset as i64 - p.base.offset as i64) as u32);
+                codegen::gen_set_reg32(ctx, r);
+                ctx.current_instruction = Instruction::Preserve {
+                    clobbered_reg: Some(r),
+                };
+            },
+            Op::PushReg(r, a) => {
+                ctx.builder.get_local(&base);
+                codegen::gen_get_reg32(ctx, r);
+                ctx.builder
+                    .store_unaligned_i32((a.offset as i64 - p.base.offset as i64) as u32);
+                codegen::gen_get_reg32(ctx, regs::ESP);
+                ctx.builder.const_i32(4);
+                ctx.builder.sub_i32();
+                codegen::gen_set_reg32(ctx, regs::ESP);
+                ctx.current_instruction = Instruction::Preserve {
+                    clobbered_reg: Some(regs::ESP),
+                };
+            },
+            Op::PushImm(value, a) => {
+                ctx.builder.get_local(&base);
+                ctx.builder.const_i32(value);
+                ctx.builder
+                    .store_unaligned_i32((a.offset as i64 - p.base.offset as i64) as u32);
+                codegen::gen_get_reg32(ctx, regs::ESP);
+                ctx.builder.const_i32(4);
+                ctx.builder.sub_i32();
+                codegen::gen_set_reg32(ctx, regs::ESP);
+                ctx.current_instruction = Instruction::Preserve {
+                    clobbered_reg: Some(regs::ESP),
+                };
+            },
+            Op::PopReg(r, a) => {
+                ctx.builder.get_local(&base);
+                ctx.builder
+                    .load_unaligned_i32((a.offset as i64 - p.base.offset as i64) as u32);
+                codegen::gen_set_reg32(ctx, r);
+                codegen::gen_get_reg32(ctx, regs::ESP);
+                ctx.builder.const_i32(4);
+                ctx.builder.add_i32();
+                codegen::gen_set_reg32(ctx, regs::ESP);
+                ctx.current_instruction = Instruction::Other;
             },
             Op::Integer => {
                 let mut flags = 0;
@@ -339,13 +513,14 @@ pub fn generate(ctx: &mut JitContext, block: &BasicBlock) -> bool {
         }
         assert!(ctx.builder.imported_call_count() == calls);
         ctx.cpu.eip = end;
-        ctx.previous_instruction =
-            std::mem::replace(&mut ctx.current_instruction, Instruction::Other);
+        ctx.advance_instruction();
     }
     ctx.builder.free_local(base);
     ctx.builder.br(done);
     ctx.builder.block_end();
     *ctx.cpu = saved_cpu;
+    ctx.block_stop_addr = p.end;
+    ctx.in_guarded_mem_run = false;
     ctx.previous_instruction = Instruction::Other;
     ctx.current_instruction = Instruction::Other;
     while ctx.cpu.eip < p.end {
@@ -353,10 +528,11 @@ pub fn generate(ctx: &mut JitContext, block: &BasicBlock) -> bool {
         let mut flags = 0;
         jit_instructions::jit_instruction(ctx, &mut flags);
         assert!(flags == 0 && ctx.cpu.eip <= p.end);
-        ctx.previous_instruction =
-            std::mem::replace(&mut ctx.current_instruction, Instruction::Other);
+        ctx.advance_instruction();
     }
     ctx.builder.block_end();
+    ctx.block_stop_addr = saved_stop_addr;
+    ctx.in_guarded_mem_run = saved_guarded;
     ctx.cpu.prefixes = 0;
     ctx.previous_instruction = Instruction::Other;
     ctx.current_instruction = Instruction::Other;

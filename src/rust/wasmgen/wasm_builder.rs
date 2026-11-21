@@ -95,6 +95,8 @@ pub struct WasmBuilder {
 
     free_locals_i32: Vec<WasmLocal>,
     free_locals_i64: Vec<WasmLocalI64>,
+    free_locals_v128: Vec<WasmLocalV128>,
+    free_locals_f64: Vec<WasmLocalF64>,
     local_count: u8,
     pub arg_local_initial_state: WasmLocal,
 }
@@ -110,6 +112,16 @@ impl WasmLocal {
 
 pub struct WasmLocalI64(u8);
 impl WasmLocalI64 {
+    pub fn idx(&self) -> u8 { self.0 }
+}
+
+pub struct WasmLocalV128(u8);
+impl WasmLocalV128 {
+    pub fn idx(&self) -> u8 { self.0 }
+}
+
+pub struct WasmLocalF64(u8);
+impl WasmLocalF64 {
     pub fn idx(&self) -> u8 { self.0 }
 }
 
@@ -144,6 +156,8 @@ impl WasmBuilder {
 
             free_locals_i32: Vec::with_capacity(8),
             free_locals_i64: Vec::with_capacity(8),
+            free_locals_v128: Vec::with_capacity(8),
+            free_locals_f64: Vec::with_capacity(8),
             local_count: 0,
             arg_local_initial_state: WasmLocal(0),
         };
@@ -177,6 +191,8 @@ impl WasmBuilder {
         self.imported_call_count = 0;
         self.free_locals_i32.clear();
         self.free_locals_i64.clear();
+        self.free_locals_v128.clear();
+        self.free_locals_f64.clear();
         self.local_count = 0;
 
         dbg_assert!(self.label_to_depth.is_empty());
@@ -225,17 +241,29 @@ impl WasmBuilder {
         self.output.push(0);
 
         dbg_assert!(
-            self.local_count as usize == self.free_locals_i32.len() + self.free_locals_i64.len(),
+            self.local_count as usize
+                == self.free_locals_i32.len()
+                    + self.free_locals_i64.len()
+                    + self.free_locals_v128.len()
+                    + self.free_locals_f64.len(),
             "All locals should have been freed"
         );
 
         let free_locals_i32 = &self.free_locals_i32;
         let free_locals_i64 = &self.free_locals_i64;
+        let free_locals_v128 = &self.free_locals_v128;
+        let free_locals_f64 = &self.free_locals_f64;
 
         let locals = (0..self.local_count).map(|i| {
             let local_index = self.argument_count + i;
             if free_locals_i64.iter().any(|v| v.idx() == local_index) {
                 op::TYPE_I64
+            }
+            else if free_locals_v128.iter().any(|v| v.idx() == local_index) {
+                op::TYPE_V128
+            }
+            else if free_locals_f64.iter().any(|v| v.idx() == local_index) {
+                op::TYPE_F64
             }
             else {
                 dbg_assert!(free_locals_i32.iter().any(|v| v.idx() == local_index));
@@ -657,14 +685,31 @@ impl WasmBuilder {
             Some(local) => local,
             None => {
                 let new_idx = self.local_count + self.argument_count;
+                assert!(
+                    new_idx < 128,
+                    "jit local index overflow: local indices are encoded as a single byte"
+                );
                 self.local_count = self.local_count.checked_add(1).unwrap();
                 WasmLocal(new_idx)
             },
         }
     }
+    pub fn can_allocate_typed_locals(&self, i32s: u8, i64s: u8, v128s: u8, f64s: u8) -> bool {
+        let new_i32 = (i32s as usize).saturating_sub(self.free_locals_i32.len());
+        let new_i64 = (i64s as usize).saturating_sub(self.free_locals_i64.len());
+        let new_v128 = (v128s as usize).saturating_sub(self.free_locals_v128.len());
+        let new_f64 = (f64s as usize).saturating_sub(self.free_locals_f64.len());
+        // Local indices currently use a single-byte LEB encoding (< 128).
+        self.local_count as usize
+            + self.argument_count as usize
+            + new_i32
+            + new_i64
+            + new_v128
+            + new_f64
+            <= 128
+    }
     pub fn can_allocate_temporary_locals(&self, additional: u8) -> bool {
-        // Local indices currently use a single-byte LEB encoding.
-        self.local_count as usize + self.argument_count as usize + additional as usize <= 128
+        self.can_allocate_typed_locals(additional, 0, 0, 0)
     }
     pub fn free_local(&mut self, local: WasmLocal) {
         dbg_assert!(
@@ -706,7 +751,11 @@ impl WasmBuilder {
             Some(local) => local,
             None => {
                 let new_idx = self.local_count + self.argument_count;
-                self.local_count += 1;
+                assert!(
+                    new_idx < 128,
+                    "jit local index overflow: local indices are encoded as a single byte"
+                );
+                self.local_count = self.local_count.checked_add(1).unwrap();
                 WasmLocalI64(new_idx)
             },
         }
@@ -736,6 +785,92 @@ impl WasmBuilder {
         self.instruction_body.push(local.idx());
     }
     pub fn set_local_i64(&mut self, local: &WasmLocalI64) {
+        self.instruction_body.push(op::OP_SETLOCAL);
+        self.instruction_body.push(local.idx());
+    }
+
+    #[must_use = "local allocated but not used"]
+    pub fn alloc_local_v128(&mut self) -> WasmLocalV128 {
+        match self.free_locals_v128.pop() {
+            Some(local) => local,
+            None => {
+                let new_idx = self.local_count + self.argument_count;
+                assert!(
+                    new_idx < 128,
+                    "jit local index overflow: local indices are encoded as a single byte"
+                );
+                self.local_count = self.local_count.checked_add(1).unwrap();
+                WasmLocalV128(new_idx)
+            },
+        }
+    }
+    pub fn free_local_v128(&mut self, local: WasmLocalV128) {
+        dbg_assert!(
+            (self.argument_count..self.local_count + self.argument_count).contains(&local.0)
+        );
+        self.free_locals_v128.push(local)
+    }
+    #[must_use = "local allocated but not used"]
+    pub fn set_new_local_v128(&mut self) -> WasmLocalV128 {
+        let local = self.alloc_local_v128();
+        self.instruction_body.push(op::OP_SETLOCAL);
+        self.instruction_body.push(local.idx());
+        local
+    }
+    #[must_use = "local allocated but not used"]
+    pub fn tee_new_local_v128(&mut self) -> WasmLocalV128 {
+        let local = self.alloc_local_v128();
+        self.instruction_body.push(op::OP_TEELOCAL);
+        self.instruction_body.push(local.idx());
+        local
+    }
+    pub fn get_local_v128(&mut self, local: &WasmLocalV128) {
+        self.instruction_body.push(op::OP_GETLOCAL);
+        self.instruction_body.push(local.idx());
+    }
+    pub fn set_local_v128(&mut self, local: &WasmLocalV128) {
+        self.instruction_body.push(op::OP_SETLOCAL);
+        self.instruction_body.push(local.idx());
+    }
+    #[allow(dead_code)]
+    pub fn tee_local_v128(&mut self, local: &WasmLocalV128) {
+        self.instruction_body.push(op::OP_TEELOCAL);
+        self.instruction_body.push(local.idx());
+    }
+
+    #[must_use = "local allocated but not used"]
+    fn alloc_local_f64(&mut self) -> WasmLocalF64 {
+        match self.free_locals_f64.pop() {
+            Some(local) => local,
+            None => {
+                let new_idx = self.local_count + self.argument_count;
+                assert!(
+                    new_idx < 128,
+                    "jit local index overflow: local indices are encoded as a single byte"
+                );
+                self.local_count = self.local_count.checked_add(1).unwrap();
+                WasmLocalF64(new_idx)
+            },
+        }
+    }
+    pub fn free_local_f64(&mut self, local: WasmLocalF64) {
+        dbg_assert!(
+            (self.argument_count..self.local_count + self.argument_count).contains(&local.0)
+        );
+        self.free_locals_f64.push(local)
+    }
+    #[must_use = "local allocated but not used"]
+    pub fn set_new_local_f64(&mut self) -> WasmLocalF64 {
+        let local = self.alloc_local_f64();
+        self.instruction_body.push(op::OP_SETLOCAL);
+        self.instruction_body.push(local.idx());
+        local
+    }
+    pub fn get_local_f64(&mut self, local: &WasmLocalF64) {
+        self.instruction_body.push(op::OP_GETLOCAL);
+        self.instruction_body.push(local.idx());
+    }
+    pub fn set_local_f64(&mut self, local: &WasmLocalF64) {
         self.instruction_body.push(op::OP_SETLOCAL);
         self.instruction_body.push(local.idx());
     }
@@ -789,6 +924,56 @@ impl WasmBuilder {
         write_leb_u32(&mut self.instruction_body, byte_offset);
     }
 
+    #[allow(dead_code)]
+    pub fn load_s8(&mut self, byte_offset: u32) {
+        self.instruction_body.push(op::OP_I32LOAD8S);
+        self.instruction_body.push(op::MEM_NO_ALIGN);
+        write_leb_u32(&mut self.instruction_body, byte_offset);
+    }
+
+    #[allow(dead_code)]
+    pub fn load_unaligned_i16s(&mut self, byte_offset: u32) {
+        self.instruction_body.push(op::OP_I32LOAD16S);
+        self.instruction_body.push(op::MEM_NO_ALIGN);
+        write_leb_u32(&mut self.instruction_body, byte_offset);
+    }
+
+    pub fn load_fixed_v128_zero64(&mut self, addr: u32) {
+        dbg_assert!((addr & 7) == 0);
+        self.const_i32(addr as i32);
+        self.simd(op::SIMD_V128_LOAD64_ZERO);
+        self.instruction_body.push(op::MEM_ALIGN64);
+        write_leb_u32(&mut self.instruction_body, 0);
+    }
+
+    pub fn load_unaligned_v128_zero64(&mut self, byte_offset: u32) {
+        self.simd(op::SIMD_V128_LOAD64_ZERO);
+        self.instruction_body.push(op::MEM_NO_ALIGN);
+        write_leb_u32(&mut self.instruction_body, byte_offset);
+    }
+
+    pub fn load_unaligned_v128_zero32(&mut self, byte_offset: u32) {
+        self.simd(op::SIMD_V128_LOAD32_ZERO);
+        self.instruction_body.push(op::MEM_NO_ALIGN);
+        write_leb_u32(&mut self.instruction_body, byte_offset);
+    }
+
+    pub fn store_aligned_v128_lane64(&mut self, byte_offset: u32, lane: u8) {
+        dbg_assert!(lane < 2);
+        self.simd(op::SIMD_V128_STORE64_LANE);
+        self.instruction_body.push(op::MEM_ALIGN64);
+        write_leb_u32(&mut self.instruction_body, byte_offset);
+        self.instruction_body.push(lane);
+    }
+
+    pub fn store_unaligned_v128_lane64(&mut self, byte_offset: u32, lane: u8) {
+        dbg_assert!(lane < 2);
+        self.simd(op::SIMD_V128_STORE64_LANE);
+        self.instruction_body.push(op::MEM_NO_ALIGN);
+        write_leb_u32(&mut self.instruction_body, byte_offset);
+        self.instruction_body.push(lane);
+    }
+
     pub fn load_unaligned_i64(&mut self, byte_offset: u32) {
         self.instruction_body.push(op::OP_I64LOAD);
         self.instruction_body.push(op::MEM_NO_ALIGN);
@@ -837,6 +1022,12 @@ impl WasmBuilder {
         write_leb_u32(&mut self.instruction_body, byte_offset);
     }
 
+    pub fn load_unaligned_v128(&mut self, byte_offset: u32) {
+        self.simd(op::SIMD_V128_LOAD);
+        self.instruction_body.push(op::MEM_NO_ALIGN);
+        write_leb_u32(&mut self.instruction_body, byte_offset);
+    }
+
     pub fn load_aligned_u16(&mut self, byte_offset: u32) {
         self.instruction_body.push(op::OP_I32LOAD16U);
         self.instruction_body.push(op::MEM_ALIGN16);
@@ -870,6 +1061,12 @@ impl WasmBuilder {
     pub fn store_aligned_v128(&mut self, byte_offset: u32) {
         self.simd(op::SIMD_V128_STORE);
         self.instruction_body.push(op::MEM_ALIGN128);
+        write_leb_u32(&mut self.instruction_body, byte_offset);
+    }
+
+    pub fn store_unaligned_v128(&mut self, byte_offset: u32) {
+        self.simd(op::SIMD_V128_STORE);
+        self.instruction_body.push(op::MEM_NO_ALIGN);
         write_leb_u32(&mut self.instruction_body, byte_offset);
     }
 
@@ -918,6 +1115,7 @@ impl WasmBuilder {
     pub fn xor_i32(&mut self) { self.instruction_body.push(op::OP_I32XOR); }
     pub fn xor_i64(&mut self) { self.instruction_body.push(op::OP_I64XOR); }
     pub fn mul_i32(&mut self) { self.instruction_body.push(op::OP_I32MUL); }
+    pub fn div_u_i32(&mut self) { self.instruction_body.push(op::OP_I32DIVU); }
     pub fn mul_i64(&mut self) { self.instruction_body.push(op::OP_I64MUL); }
     pub fn div_i64(&mut self) { self.instruction_body.push(op::OP_I64DIVU); }
     pub fn rem_i64(&mut self) { self.instruction_body.push(op::OP_I64REMU); }
@@ -936,31 +1134,99 @@ impl WasmBuilder {
         self.instruction_body.extend(bytes);
     }
     pub fn bitselect_v128(&mut self) { self.simd(op::SIMD_V128_BITSELECT); }
+    #[allow(dead_code)]
+    pub fn not_v128(&mut self) { self.simd(op::SIMD_V128_NOT); }
     pub fn and_v128(&mut self) { self.simd(op::SIMD_V128_AND); }
+    pub fn andnot_v128(&mut self) { self.simd(op::SIMD_V128_ANDNOT); }
+    pub fn or_v128(&mut self) { self.simd(op::SIMD_V128_OR); }
     pub fn xor_v128(&mut self) { self.simd(op::SIMD_V128_XOR); }
+    #[allow(dead_code)]
+    pub fn splat_i32x4(&mut self) { self.simd(op::SIMD_I32X4_SPLAT); }
     pub fn splat_i64x2(&mut self) { self.simd(op::SIMD_I64X2_SPLAT); }
+    pub fn extract_i16x8_lane_u(&mut self, lane: u8) {
+        dbg_assert!(lane < 8);
+        self.simd(op::SIMD_I16X8_EXTRACT_LANE_U);
+        self.instruction_body.push(lane);
+    }
+    pub fn replace_i16x8_lane(&mut self, lane: u8) {
+        dbg_assert!(lane < 8);
+        self.simd(op::SIMD_I16X8_REPLACE_LANE);
+        self.instruction_body.push(lane);
+    }
+    pub fn extract_i32x4_lane(&mut self, lane: u8) {
+        dbg_assert!(lane < 4);
+        self.simd(op::SIMD_I32X4_EXTRACT_LANE);
+        self.instruction_body.push(lane);
+    }
+    pub fn replace_i32x4_lane(&mut self, lane: u8) {
+        dbg_assert!(lane < 4);
+        self.simd(op::SIMD_I32X4_REPLACE_LANE);
+        self.instruction_body.push(lane);
+    }
     pub fn extract_i64x2_lane(&mut self, lane: u8) {
         dbg_assert!(lane < 2);
         self.simd(op::SIMD_I64X2_EXTRACT_LANE);
         self.instruction_body.push(lane);
     }
+    pub fn replace_i64x2_lane(&mut self, lane: u8) {
+        dbg_assert!(lane < 2);
+        self.simd(op::SIMD_I64X2_REPLACE_LANE);
+        self.instruction_body.push(lane);
+    }
+    pub fn eq_i8x16(&mut self) { self.simd(op::SIMD_I8X16_EQ); }
+    pub fn gt_s_i8x16(&mut self) { self.simd(op::SIMD_I8X16_GT_S); }
+    pub fn eq_i16x8(&mut self) { self.simd(op::SIMD_I16X8_EQ); }
+    pub fn gt_s_i16x8(&mut self) { self.simd(op::SIMD_I16X8_GT_S); }
+    pub fn eq_i32x4(&mut self) { self.simd(op::SIMD_I32X4_EQ); }
+    pub fn gt_s_i32x4(&mut self) { self.simd(op::SIMD_I32X4_GT_S); }
     pub fn lt_f32x4(&mut self) { self.simd(op::SIMD_F32X4_LT); }
     pub fn trunc_sat_f32x4_s(&mut self) { self.simd(op::SIMD_I32X4_TRUNC_SAT_F32X4_S); }
+    pub fn convert_i32x4_s(&mut self) { self.simd(op::SIMD_F32X4_CONVERT_I32X4_S); }
+    pub fn i8x16_narrow_i16x8_s(&mut self) { self.simd(op::SIMD_I8X16_NARROW_I16X8_S); }
     pub fn i8x16_narrow_i16x8_u(&mut self) { self.simd(op::SIMD_I8X16_NARROW_I16X8_U); }
+    #[allow(dead_code)]
+    pub fn shr_s_i8x16(&mut self) { self.simd(op::SIMD_I8X16_SHR_S); }
+    pub fn add_i8x16(&mut self) { self.simd(op::SIMD_I8X16_ADD); }
+    pub fn add_sat_s_i8x16(&mut self) { self.simd(op::SIMD_I8X16_ADD_SAT_S); }
+    pub fn add_sat_u_i8x16(&mut self) { self.simd(op::SIMD_I8X16_ADD_SAT_U); }
+    pub fn sub_i8x16(&mut self) { self.simd(op::SIMD_I8X16_SUB); }
+    pub fn sub_sat_s_i8x16(&mut self) { self.simd(op::SIMD_I8X16_SUB_SAT_S); }
+    pub fn sub_sat_u_i8x16(&mut self) { self.simd(op::SIMD_I8X16_SUB_SAT_U); }
+    pub fn min_u_i8x16(&mut self) { self.simd(op::SIMD_I8X16_MIN_U); }
+    pub fn max_u_i8x16(&mut self) { self.simd(op::SIMD_I8X16_MAX_U); }
+    pub fn avgr_u_i8x16(&mut self) { self.simd(op::SIMD_I8X16_AVGR_U); }
     pub fn i16x8_narrow_i32x4_s(&mut self) { self.simd(op::SIMD_I16X8_NARROW_I32X4_S); }
     pub fn shl_i16x8(&mut self) { self.simd(op::SIMD_I16X8_SHL); }
     pub fn shr_s_i16x8(&mut self) { self.simd(op::SIMD_I16X8_SHR_S); }
     pub fn shr_u_i16x8(&mut self) { self.simd(op::SIMD_I16X8_SHR_U); }
     pub fn add_i16x8(&mut self) { self.simd(op::SIMD_I16X8_ADD); }
+    pub fn add_sat_s_i16x8(&mut self) { self.simd(op::SIMD_I16X8_ADD_SAT_S); }
+    pub fn add_sat_u_i16x8(&mut self) { self.simd(op::SIMD_I16X8_ADD_SAT_U); }
     pub fn sub_i16x8(&mut self) { self.simd(op::SIMD_I16X8_SUB); }
+    pub fn sub_sat_s_i16x8(&mut self) { self.simd(op::SIMD_I16X8_SUB_SAT_S); }
+    pub fn sub_sat_u_i16x8(&mut self) { self.simd(op::SIMD_I16X8_SUB_SAT_U); }
     pub fn mul_i16x8(&mut self) { self.simd(op::SIMD_I16X8_MUL); }
+    pub fn min_s_i16x8(&mut self) { self.simd(op::SIMD_I16X8_MIN_S); }
+    pub fn max_s_i16x8(&mut self) { self.simd(op::SIMD_I16X8_MAX_S); }
+    pub fn avgr_u_i16x8(&mut self) { self.simd(op::SIMD_I16X8_AVGR_U); }
+    pub fn shl_i32x4(&mut self) { self.simd(op::SIMD_I32X4_SHL); }
     pub fn shr_s_i32x4(&mut self) { self.simd(op::SIMD_I32X4_SHR_S); }
+    pub fn shr_u_i32x4(&mut self) { self.simd(op::SIMD_I32X4_SHR_U); }
     pub fn add_i32x4(&mut self) { self.simd(op::SIMD_I32X4_ADD); }
+    pub fn sub_i32x4(&mut self) { self.simd(op::SIMD_I32X4_SUB); }
+    pub fn shl_i64x2(&mut self) { self.simd(op::SIMD_I64X2_SHL); }
+    pub fn shr_u_i64x2(&mut self) { self.simd(op::SIMD_I64X2_SHR_U); }
+    pub fn add_i64x2(&mut self) { self.simd(op::SIMD_I64X2_ADD); }
+    pub fn sub_i64x2(&mut self) { self.simd(op::SIMD_I64X2_SUB); }
     pub fn dot_i16x8_s(&mut self) { self.simd(op::SIMD_I32X4_DOT_I16X8_S); }
     pub fn extmul_low_i16x8_s(&mut self) { self.simd(op::SIMD_I32X4_EXTMUL_LOW_I16X8_S); }
+    pub fn extmul_high_i16x8_s(&mut self) { self.simd(op::SIMD_I32X4_EXTMUL_HIGH_I16X8_S); }
+    pub fn extmul_low_i16x8_u(&mut self) { self.simd(op::SIMD_I32X4_EXTMUL_LOW_I16X8_U); }
+    pub fn extmul_high_i16x8_u(&mut self) { self.simd(op::SIMD_I32X4_EXTMUL_HIGH_I16X8_U); }
     pub fn add_f32x4(&mut self) { self.simd(op::SIMD_F32X4_ADD); }
     pub fn sub_f32x4(&mut self) { self.simd(op::SIMD_F32X4_SUB); }
     pub fn mul_f32x4(&mut self) { self.simd(op::SIMD_F32X4_MUL); }
+    pub fn div_f32x4(&mut self) { self.simd(op::SIMD_F32X4_DIV); }
 
     pub fn rotl_i32(&mut self) { self.instruction_body.push(op::OP_I32ROTL); }
 

@@ -10,7 +10,7 @@ use crate::modrm::ModrmByte;
 use crate::opstats;
 use crate::profiler;
 use crate::regs;
-use crate::wasmgen::wasm_builder::{WasmBuilder, WasmLocal, WasmLocalI64};
+use crate::wasmgen::wasm_builder::{WasmBuilder, WasmLocal, WasmLocalI64, WasmLocalV128};
 
 pub fn gen_add_cs_offset(ctx: &mut JitContext) {
     if !ctx.cpu.has_flat_segmentation() {
@@ -95,6 +95,49 @@ pub fn gen_page_switch_check(
     last_instruction_addr: u32,
 ) {
     // After switching a page while in jitted code, check if the page mapping still holds
+
+    if let Some((base, permissions)) = unsafe { crate::cpu::vine::common_memory() }.filter(|_| {
+        ctx.cpu.cpl3() && ctx.cpu.has_flat_segmentation() && !cfg!(feature = "profiler")
+    }) {
+        let mem_base = unsafe { memory::mem8 } as u32;
+        if base >= mem_base {
+            let guest_offset = base - mem_base;
+            if next_block_addr >= guest_offset {
+                let expected_virt_addr = next_block_addr - guest_offset;
+                let page = expected_virt_addr >> 12;
+                let (exec_enabled_ptr, exec_bitmap_ptr) =
+                    crate::cpu::vine::execute_protection_pointers();
+
+                gen_get_eip(ctx.builder);
+                ctx.builder.const_i32(expected_virt_addr as i32);
+                ctx.builder.ne_i32();
+                ctx.builder.load_fixed_u8(permissions + page);
+                ctx.builder.const_i32(1);
+                ctx.builder.and_i32();
+                ctx.builder.eqz_i32();
+                ctx.builder.or_i32();
+                ctx.builder.load_fixed_u8(exec_enabled_ptr);
+                ctx.builder.load_fixed_u8(exec_bitmap_ptr + (page >> 3));
+                ctx.builder.const_i32(1 << (page & 7));
+                ctx.builder.and_i32();
+                ctx.builder.eqz_i32();
+                ctx.builder.and_i32();
+                ctx.builder.or_i32();
+
+                if cfg!(debug_assertions) {
+                    ctx.builder.if_void();
+                    gen_profiler_stat_increment(ctx.builder, profiler::stat::FAILED_PAGE_CHANGE);
+                    gen_debug_track_jit_exit(ctx.builder, last_instruction_addr);
+                    ctx.builder.br(ctx.exit_label);
+                    ctx.builder.block_end();
+                }
+                else {
+                    ctx.builder.br_if(ctx.exit_label);
+                }
+                return;
+            }
+        }
+    }
 
     gen_get_eip(ctx.builder);
     let address_local = ctx.builder.set_new_local();
@@ -315,17 +358,157 @@ pub fn decr_exc_asize(ctx: &mut JitContext) {
 pub fn gen_read_reg_xmm128_into_scratch(ctx: &mut JitContext, r: u32) {
     ctx.builder
         .const_i32(global_pointers::sse_scratch_register as i32);
-    let dest = global_pointers::get_reg_xmm_offset(r);
-    ctx.builder.const_i32(dest as i32);
-    ctx.builder.load_aligned_i64(0);
-    ctx.builder.store_aligned_i64(0);
-
     ctx.builder
-        .const_i32(global_pointers::sse_scratch_register as i32 + 8);
-    let dest = global_pointers::get_reg_xmm_offset(r) + 8;
+        .load_fixed_v128(global_pointers::get_reg_xmm_offset(r));
+    ctx.builder.store_aligned_v128(0);
+}
+
+pub fn gen_vec_cache_active(ctx: &JitContext) -> bool {
+    ctx.mmx_tags_dirty
+        || ctx.mmx_cache.iter().any(|x| x.is_some())
+        || ctx.xmm_cache.iter().any(|x| x.is_some())
+}
+
+pub fn gen_vec_has_dirty(ctx: &JitContext) -> bool {
+    ctx.mmx_dirty != 0 || ctx.mmx_tags_dirty || ctx.xmm_dirty != 0
+}
+
+fn gen_mmx_transition_now(ctx: &mut JitContext) {
+    ctx.builder.const_i32(0);
+    ctx.builder.const_i32(0);
+    ctx.builder
+        .store_u8(global_pointers::fpu_stack_empty as u32);
+    ctx.builder.const_i32(0);
+    ctx.builder.const_i32(0);
+    ctx.builder.store_u8(global_pointers::fpu_stack_ptr as u32);
+}
+
+pub fn gen_vec_flush_for_cold_path(ctx: &mut JitContext) {
+    if !gen_vec_has_dirty(ctx) {
+        return;
+    }
+    for r in 0..8u32 {
+        if ctx.mmx_dirty & (1 << r) != 0 {
+            if let Some(ref local) = ctx.mmx_cache[r as usize] {
+                let dest = global_pointers::get_reg_mmx_offset(r);
+                ctx.builder.const_i32(dest as i32);
+                ctx.builder.get_local_v128(local);
+                ctx.builder.store_aligned_v128_lane64(0, 0);
+                ctx.builder.const_i32(0);
+                ctx.builder.const_i32(0xFFFF);
+                ctx.builder.store_aligned_u16(dest + 8);
+            }
+        }
+        if ctx.xmm_dirty & (1 << r) != 0 {
+            if let Some(ref local) = ctx.xmm_cache[r as usize] {
+                ctx.builder
+                    .const_i32(global_pointers::get_reg_xmm_offset(r) as i32);
+                ctx.builder.get_local_v128(local);
+                ctx.builder.store_aligned_v128(0);
+            }
+        }
+    }
+    if ctx.mmx_tags_dirty {
+        gen_mmx_transition_now(ctx);
+    }
+}
+
+pub fn gen_vec_flush_and_clear(ctx: &mut JitContext) {
+    gen_vec_flush_for_cold_path(ctx);
+    for slot in &mut ctx.mmx_cache {
+        if let Some(local) = slot.take() {
+            ctx.builder.free_local_v128(local);
+        }
+    }
+    for slot in &mut ctx.xmm_cache {
+        if let Some(local) = slot.take() {
+            ctx.builder.free_local_v128(local);
+        }
+    }
+    ctx.mmx_dirty = 0;
+    ctx.mmx_tags_dirty = false;
+    ctx.xmm_dirty = 0;
+}
+
+pub fn gen_get_mmx_v128(ctx: &mut JitContext, r: u32) {
+    if let Some(ref local) = ctx.mmx_cache[r as usize] {
+        ctx.builder.get_local_v128(local);
+        return;
+    }
+    ctx.builder
+        .load_fixed_v128_zero64(global_pointers::get_reg_mmx_offset(r));
+    if !cfg!(feature = "profiler") && ctx.builder.can_allocate_typed_locals(0, 0, 12, 0) {
+        let local = ctx.builder.tee_new_local_v128();
+        ctx.mmx_cache[r as usize] = Some(local);
+    }
+}
+
+pub fn gen_set_mmx_v128(ctx: &mut JitContext, r: u32) {
+    if let Some(ref local) = ctx.mmx_cache[r as usize] {
+        ctx.builder.set_local_v128(local);
+        ctx.mmx_dirty |= 1 << r;
+        ctx.mmx_tags_dirty = true;
+        return;
+    }
+    if !cfg!(feature = "profiler") && ctx.builder.can_allocate_typed_locals(0, 0, 12, 0) {
+        let local = ctx.builder.set_new_local_v128();
+        ctx.mmx_cache[r as usize] = Some(local);
+        ctx.mmx_dirty |= 1 << r;
+        ctx.mmx_tags_dirty = true;
+        return;
+    }
+    let tmp = ctx.builder.set_new_local_v128();
+    let dest = global_pointers::get_reg_mmx_offset(r);
     ctx.builder.const_i32(dest as i32);
-    ctx.builder.load_aligned_i64(0);
-    ctx.builder.store_aligned_i64(0);
+    ctx.builder.get_local_v128(&tmp);
+    ctx.builder.store_aligned_v128_lane64(0, 0);
+    ctx.builder.free_local_v128(tmp);
+    ctx.builder.const_i32(0);
+    ctx.builder.const_i32(0xFFFF);
+    ctx.builder.store_aligned_u16(dest + 8);
+    gen_mmx_transition_now(ctx);
+}
+
+pub fn gen_mmx_mark_transition(ctx: &mut JitContext) {
+    if !cfg!(feature = "profiler") {
+        ctx.mmx_tags_dirty = true;
+    }
+    else {
+        gen_mmx_transition_now(ctx);
+    }
+}
+
+pub fn gen_get_xmm_v128(ctx: &mut JitContext, r: u32) {
+    if let Some(ref local) = ctx.xmm_cache[r as usize] {
+        ctx.builder.get_local_v128(local);
+        return;
+    }
+    ctx.builder
+        .load_fixed_v128(global_pointers::get_reg_xmm_offset(r));
+    if !cfg!(feature = "profiler") && ctx.builder.can_allocate_typed_locals(0, 0, 12, 0) {
+        let local = ctx.builder.tee_new_local_v128();
+        ctx.xmm_cache[r as usize] = Some(local);
+    }
+}
+
+pub fn gen_set_xmm_v128(ctx: &mut JitContext, r: u32) {
+    if let Some(ref local) = ctx.xmm_cache[r as usize] {
+        ctx.builder.set_local_v128(local);
+        ctx.xmm_dirty |= 1 << r;
+        return;
+    }
+    if !cfg!(feature = "profiler") && ctx.builder.can_allocate_typed_locals(0, 0, 12, 0) {
+        let local = ctx.builder.set_new_local_v128();
+        ctx.xmm_cache[r as usize] = Some(local);
+        ctx.xmm_dirty |= 1 << r;
+        return;
+    }
+    let tmp = ctx.builder.set_new_local_v128();
+    ctx.builder
+        .const_i32(global_pointers::get_reg_xmm_offset(r) as i32);
+    ctx.builder.get_local_v128(&tmp);
+    ctx.builder.store_aligned_v128(0);
+    ctx.builder.free_local_v128(tmp);
 }
 
 pub fn gen_get_sreg(ctx: &mut JitContext, r: u32) {
@@ -341,7 +524,7 @@ pub fn gen_get_ss_offset(ctx: &mut JitContext) {
 pub fn gen_get_flags(builder: &mut WasmBuilder) {
     builder.load_fixed_i32(global_pointers::flags as u32);
 }
-fn gen_get_flags_changed(builder: &mut WasmBuilder) {
+pub(crate) fn gen_get_flags_changed(builder: &mut WasmBuilder) {
     builder.load_fixed_i32(global_pointers::flags_changed as u32);
 }
 fn gen_get_last_result(builder: &mut WasmBuilder, previous_instruction: &Instruction) {
@@ -369,6 +552,24 @@ fn gen_get_last_result(builder: &mut WasmBuilder, previous_instruction: &Instruc
             dest: InstructionOperandDest::WasmLocal(l),
             opsize: OPSIZE_32,
         } => builder.get_local(&l),
+        Instruction::Test {
+            dest: InstructionOperandDest::WasmLocal(d),
+            source: InstructionOperand::Immediate(i),
+            opsize: OPSIZE_32,
+        } => {
+            builder.get_local(d);
+            builder.const_i32(*i);
+            builder.and_i32();
+        },
+        Instruction::Test {
+            dest: InstructionOperandDest::WasmLocal(d),
+            source: InstructionOperand::WasmLocal(s),
+            opsize: OPSIZE_32,
+        } => {
+            builder.get_local(d);
+            builder.get_local(s);
+            builder.and_i32();
+        },
         Instruction::Cmp {
             dest: InstructionOperandDest::WasmLocal(l),
             source,
@@ -410,6 +611,12 @@ pub fn gen_readable_or_pagefault(ctx: &mut JitContext, address_local: &WasmLocal
         ctx.builder.br(ctx.exit_with_fault_label);
         ctx.builder.block_end();
     }
+    else if gen_vec_has_dirty(ctx) {
+        ctx.builder.if_void();
+        gen_vec_flush_for_cold_path(ctx);
+        ctx.builder.br(ctx.exit_with_fault_label);
+        ctx.builder.block_end();
+    }
     else {
         ctx.builder.br_if(ctx.exit_with_fault_label);
     }
@@ -427,6 +634,12 @@ pub fn gen_writable_or_pagefault(ctx: &mut JitContext, address_local: &WasmLocal
     if cfg!(feature = "profiler") {
         ctx.builder.if_void();
         gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
+        ctx.builder.br(ctx.exit_with_fault_label);
+        ctx.builder.block_end();
+    }
+    else if gen_vec_has_dirty(ctx) {
+        ctx.builder.if_void();
+        gen_vec_flush_for_cold_path(ctx);
         ctx.builder.br(ctx.exit_with_fault_label);
         ctx.builder.block_end();
     }
@@ -542,6 +755,11 @@ pub fn gen_modrm_resolve_safe_read128(
         gen_safe_read128(ctx, addr, where_to_write)
     });
 }
+pub fn gen_modrm_resolve_safe_read128_v128(ctx: &mut JitContext, modrm_byte: ModrmByte) {
+    gen_modrm_resolve_with_local(ctx, modrm_byte, &|ctx, addr| {
+        gen_safe_read128_v128(ctx, addr)
+    });
+}
 
 pub fn gen_safe_read8(ctx: &mut JitContext, address_local: &WasmLocal) {
     gen_safe_read(ctx, BitSize::BYTE, address_local, None);
@@ -558,12 +776,18 @@ pub fn gen_safe_read64(ctx: &mut JitContext, address_local: &WasmLocal) {
 pub fn gen_safe_read128(ctx: &mut JitContext, address_local: &WasmLocal, where_to_write: u32) {
     gen_safe_read(ctx, BitSize::DQWORD, &address_local, Some(where_to_write));
 }
+pub fn gen_safe_read128_v128(ctx: &mut JitContext, address_local: &WasmLocal) {
+    gen_safe_read(ctx, BitSize::DQWORD, address_local, None);
+}
 
 // only used internally for gen_safe_write
+#[allow(dead_code)]
 enum GenSafeWriteValue<'a> {
     I32(&'a WasmLocal),
     I64(&'a WasmLocalI64),
     TwoI64s(&'a WasmLocalI64, &'a WasmLocalI64),
+    FixedV128(u32),
+    V128(&'a WasmLocalV128),
 }
 
 enum GenSafeReadWriteValue {
@@ -628,6 +852,7 @@ pub fn gen_safe_write64(
     )
 }
 
+#[allow(dead_code)]
 pub fn gen_safe_write128(
     ctx: &mut JitContext,
     address_local: &WasmLocal,
@@ -642,11 +867,82 @@ pub fn gen_safe_write128(
     )
 }
 
+#[allow(dead_code)]
+pub fn gen_safe_write128_from_fixed(
+    ctx: &mut JitContext,
+    address_local: &WasmLocal,
+    source_fixed_addr: u32,
+) {
+    gen_safe_write(
+        ctx,
+        BitSize::DQWORD,
+        address_local,
+        GenSafeWriteValue::FixedV128(source_fixed_addr),
+    )
+}
+
+pub fn gen_safe_write128_v128(
+    ctx: &mut JitContext,
+    address_local: &WasmLocal,
+    value_local: &WasmLocalV128,
+) {
+    gen_safe_write(
+        ctx,
+        BitSize::DQWORD,
+        address_local,
+        GenSafeWriteValue::V128(value_local),
+    )
+}
+
+// Emits `entry = address + base` and loads the shared permission byte of the
+// address' page into a fresh local for the Vine common arena. The caller
+// tests the base bits (1 = read, 2 = write) directly for single-byte accesses
+// or the span bits (4 = read on this and the next page, 8 = write on both) for
+// wider accesses. Returns None when the common arena does not apply and the
+// caller must use gen_memory_guard's tlb_data path instead.
+fn gen_common_memory_guard(
+    ctx: &mut JitContext,
+    address: &WasmLocal,
+) -> Option<(WasmLocal, WasmLocal)> {
+    let (base, permissions) = unsafe { crate::cpu::vine::common_memory() }
+        .filter(|_| ctx.cpu.cpl3() && !cfg!(feature = "profiler"))?;
+    ctx.builder.get_local(address);
+    ctx.builder.const_i32(base as i32);
+    ctx.builder.add_i32();
+    let entry = ctx.builder.set_new_local();
+    ctx.builder.get_local(address);
+    ctx.builder.const_i32(12);
+    ctx.builder.shr_u_i32();
+    ctx.builder.load_u8(permissions);
+    let perm = ctx.builder.set_new_local();
+    Some((entry, perm))
+}
+
+// Emits `(perm & mask) == mask` on the operand stack.
+fn gen_perm_mask_test(ctx: &mut JitContext, perm: &WasmLocal, mask: i32) {
+    ctx.builder.get_local(perm);
+    ctx.builder.const_i32(mask);
+    ctx.builder.and_i32();
+    if mask != 1 {
+        ctx.builder.const_i32(mask);
+        ctx.builder.eq_i32();
+    }
+}
+
+// Emits `(address & 0xfff) <= 0x1000 - bytes` on the operand stack.
+fn gen_within_page_test(ctx: &mut JitContext, address: &WasmLocal, bytes: i32) {
+    ctx.builder.get_local(address);
+    ctx.builder.const_i32(0xFFF);
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(0x1000 - bytes);
+    ctx.builder.le_i32();
+}
+
 // Common memory is restricted to Runtime-owned user mappings. Its permission
 // table covers every u32 address; denied/unmapped/high pages take the existing
 // precise slow path. Writable executable pages never use direct stores, so the
 // original SMC barrier and interpreter retry remain in force.
-fn gen_memory_guard(
+pub(crate) fn gen_memory_guard(
     ctx: &mut JitContext,
     address: &WasmLocal,
     read: bool,
@@ -666,8 +962,10 @@ fn gen_memory_guard(
         let mask = i32::from(read) | i32::from(write) << 1;
         ctx.builder.const_i32(mask);
         ctx.builder.and_i32();
-        ctx.builder.const_i32(mask);
-        ctx.builder.eq_i32();
+        if mask != 1 {
+            ctx.builder.const_i32(mask);
+            ctx.builder.eq_i32();
+        }
         (entry, true)
     }
     else {
@@ -691,7 +989,7 @@ fn gen_memory_guard(
     }
 }
 
-fn gen_resolved_memory_address(
+pub(crate) fn gen_resolved_memory_address(
     ctx: &mut JitContext,
     entry: &WasmLocal,
     address: &WasmLocal,
@@ -722,19 +1020,38 @@ fn gen_safe_read(
     //   fast: mem[(entry & ~0xFFF) ^ addr]
 
     let cont = ctx.builder.block_void();
-    let (entry_local, common) = gen_memory_guard(ctx, address_local, true, false);
-
-    if bits != BitSize::BYTE {
-        ctx.builder.get_local(&address_local);
-        ctx.builder.const_i32(0xFFF);
-        ctx.builder.and_i32();
-        ctx.builder.const_i32(0x1000 - bits.bytes() as i32);
-        ctx.builder.le_i32();
-
-        ctx.builder.and_i32();
-    }
-
-    ctx.builder.br_if(cont);
+    let saved_mmx_cr0 = ctx.mmx_task_switch_call_count;
+    let calls_before = ctx.builder.imported_call_count();
+    let (entry_local, common) =
+        if let Some((entry, perm)) = gen_common_memory_guard(ctx, address_local) {
+            if bits == BitSize::BYTE {
+                // A single byte never crosses a page; read permission suffices.
+                gen_perm_mask_test(ctx, &perm, 1);
+            }
+            else {
+                // Span bit: this and the next page are both readable, so no
+                // page-boundary check is needed at all.
+                ctx.builder.get_local(&perm);
+                ctx.builder.const_i32(4);
+                ctx.builder.and_i32();
+                ctx.builder.br_if(cont);
+                gen_perm_mask_test(ctx, &perm, 1);
+                gen_within_page_test(ctx, address_local, bits.bytes() as i32);
+                ctx.builder.and_i32();
+            }
+            ctx.builder.br_if(cont);
+            ctx.builder.free_local(perm);
+            (entry, true)
+        }
+        else {
+            let (entry, common) = gen_memory_guard(ctx, address_local, true, false);
+            if bits != BitSize::BYTE {
+                gen_within_page_test(ctx, address_local, bits.bytes() as i32);
+                ctx.builder.and_i32();
+            }
+            ctx.builder.br_if(cont);
+            (entry, common)
+        };
 
     if cfg!(feature = "profiler") {
         ctx.builder.get_local(&address_local);
@@ -776,10 +1093,40 @@ fn gen_safe_read(
         ctx.builder.and_i32();
     }
 
-    ctx.builder.br_if(ctx.exit_with_fault_label);
+    if gen_vec_has_dirty(ctx) || ctx.fault_precharge.is_some() {
+        ctx.builder.if_void();
+        gen_vec_flush_for_cold_path(ctx);
+        if let Some(k) = ctx.fault_precharge {
+            // On a real CPU exception (bit 1 of the slow helper's exit code)
+            // undo the pre-charge for the instructions after the faulting one;
+            // the interpreter counts the faulting instruction as retired. A
+            // bail (bit 1 clear, e.g. SMC) keeps the full pre-charge exactly as
+            // before. gen_update_instruction_counter publishes the local.
+            if k > 1 {
+                ctx.builder.get_local(&ctx.instruction_counter);
+                ctx.builder.const_i32(k as i32 - 1);
+                ctx.builder.get_local(&entry_local);
+                ctx.builder.const_i32(1);
+                ctx.builder.shr_u_i32();
+                ctx.builder.const_i32(1);
+                ctx.builder.and_i32();
+                ctx.builder.mul_i32();
+                ctx.builder.sub_i32();
+                ctx.builder.set_local(&ctx.instruction_counter);
+            }
+        }
+        ctx.builder.br(ctx.exit_with_fault_label);
+        ctx.builder.block_end();
+    }
+    else {
+        ctx.builder.br_if(ctx.exit_with_fault_label);
+    }
     if common {
         gen_resolved_memory_address(ctx, &entry_local, address_local, false);
         ctx.builder.set_local(&entry_local);
+        if saved_mmx_cr0 == Some(calls_before) {
+            ctx.mmx_task_switch_call_count = Some(ctx.builder.imported_call_count());
+        }
     }
 
     ctx.builder.block_end();
@@ -789,7 +1136,7 @@ fn gen_safe_read(
     gen_resolved_memory_address(ctx, &entry_local, address_local, common);
 
     // where_to_write is only used by dqword
-    dbg_assert!((where_to_write != None) == (bits == BitSize::DQWORD));
+    dbg_assert!(where_to_write.is_none() || bits == BitSize::DQWORD);
 
     match bits {
         BitSize::BYTE => {
@@ -805,19 +1152,17 @@ fn gen_safe_read(
             ctx.builder.load_unaligned_i64(0);
         },
         BitSize::DQWORD => {
-            let where_to_write = where_to_write.unwrap();
-            let virt_address_local = ctx.builder.set_new_local();
-            ctx.builder.const_i32(0);
-            ctx.builder.get_local(&virt_address_local);
-            ctx.builder.load_unaligned_i64(0);
-            ctx.builder.store_unaligned_i64(where_to_write);
-
-            ctx.builder.const_i32(0);
-            ctx.builder.get_local(&virt_address_local);
-            ctx.builder.load_unaligned_i64(8);
-            ctx.builder.store_unaligned_i64(where_to_write + 8);
-
-            ctx.builder.free_local(virt_address_local);
+            if let Some(where_to_write) = where_to_write {
+                let virt_address_local = ctx.builder.set_new_local();
+                ctx.builder.const_i32(where_to_write as i32);
+                ctx.builder.get_local(&virt_address_local);
+                ctx.builder.load_unaligned_v128(0);
+                ctx.builder.store_aligned_v128(0);
+                ctx.builder.free_local(virt_address_local);
+            }
+            else {
+                ctx.builder.load_unaligned_v128(0);
+            }
         },
     }
 
@@ -917,19 +1262,38 @@ fn gen_safe_write(
     //   fast: mem[(entry & ~0xFFF) ^ addr] <- value
 
     let cont = ctx.builder.block_void();
-    let (entry_local, common) = gen_memory_guard(ctx, address_local, false, true);
-
-    if bits != BitSize::BYTE {
-        ctx.builder.get_local(&address_local);
-        ctx.builder.const_i32(0xFFF);
-        ctx.builder.and_i32();
-        ctx.builder.const_i32(0x1000 - bits.bytes() as i32);
-        ctx.builder.le_i32();
-
-        ctx.builder.and_i32();
-    }
-
-    ctx.builder.br_if(cont);
+    let saved_mmx_cr0 = ctx.mmx_task_switch_call_count;
+    let calls_before = ctx.builder.imported_call_count();
+    let (entry_local, common) =
+        if let Some((entry, perm)) = gen_common_memory_guard(ctx, address_local) {
+            if bits == BitSize::BYTE {
+                // A single byte never crosses a page; write permission suffices.
+                gen_perm_mask_test(ctx, &perm, 2);
+            }
+            else {
+                // Span bit: this and the next page are both writable, so no
+                // page-boundary check is needed at all.
+                ctx.builder.get_local(&perm);
+                ctx.builder.const_i32(8);
+                ctx.builder.and_i32();
+                ctx.builder.br_if(cont);
+                gen_perm_mask_test(ctx, &perm, 2);
+                gen_within_page_test(ctx, address_local, bits.bytes() as i32);
+                ctx.builder.and_i32();
+            }
+            ctx.builder.br_if(cont);
+            ctx.builder.free_local(perm);
+            (entry, true)
+        }
+        else {
+            let (entry, common) = gen_memory_guard(ctx, address_local, false, true);
+            if bits != BitSize::BYTE {
+                gen_within_page_test(ctx, address_local, bits.bytes() as i32);
+                ctx.builder.and_i32();
+            }
+            ctx.builder.br_if(cont);
+            (entry, common)
+        };
 
     if cfg!(feature = "profiler") {
         ctx.builder.get_local(&address_local);
@@ -944,6 +1308,16 @@ fn gen_safe_write(
         GenSafeWriteValue::TwoI64s(local1, local2) => {
             ctx.builder.get_local_i64(local1);
             ctx.builder.get_local_i64(local2)
+        },
+        GenSafeWriteValue::FixedV128(source_fixed_addr) => {
+            ctx.builder.load_fixed_i64(source_fixed_addr);
+            ctx.builder.load_fixed_i64(source_fixed_addr + 8);
+        },
+        GenSafeWriteValue::V128(local) => {
+            ctx.builder.get_local_v128(local);
+            ctx.builder.extract_i64x2_lane(0);
+            ctx.builder.get_local_v128(local);
+            ctx.builder.extract_i64x2_lane(1);
         },
     }
 
@@ -986,10 +1360,40 @@ fn gen_safe_write(
         ctx.builder.and_i32();
     }
 
-    ctx.builder.br_if(ctx.exit_with_fault_label);
+    if gen_vec_has_dirty(ctx) || ctx.fault_precharge.is_some() {
+        ctx.builder.if_void();
+        gen_vec_flush_for_cold_path(ctx);
+        if let Some(k) = ctx.fault_precharge {
+            // On a real CPU exception (bit 1 of the slow helper's exit code)
+            // undo the pre-charge for the instructions after the faulting one;
+            // the interpreter counts the faulting instruction as retired. A
+            // bail (bit 1 clear, e.g. SMC) keeps the full pre-charge exactly as
+            // before. gen_update_instruction_counter publishes the local.
+            if k > 1 {
+                ctx.builder.get_local(&ctx.instruction_counter);
+                ctx.builder.const_i32(k as i32 - 1);
+                ctx.builder.get_local(&entry_local);
+                ctx.builder.const_i32(1);
+                ctx.builder.shr_u_i32();
+                ctx.builder.const_i32(1);
+                ctx.builder.and_i32();
+                ctx.builder.mul_i32();
+                ctx.builder.sub_i32();
+                ctx.builder.set_local(&ctx.instruction_counter);
+            }
+        }
+        ctx.builder.br(ctx.exit_with_fault_label);
+        ctx.builder.block_end();
+    }
+    else {
+        ctx.builder.br_if(ctx.exit_with_fault_label);
+    }
     if common {
         gen_resolved_memory_address(ctx, &entry_local, address_local, false);
         ctx.builder.set_local(&entry_local);
+        if saved_mmx_cr0 == Some(calls_before) {
+            ctx.mmx_task_switch_call_count = Some(ctx.builder.imported_call_count());
+        }
     }
 
     ctx.builder.block_end();
@@ -1012,6 +1416,16 @@ fn gen_safe_write(
             ctx.builder.get_local_i64(local2);
             ctx.builder.store_unaligned_i64(8);
             ctx.builder.free_local(virt_address_local);
+        },
+        GenSafeWriteValue::FixedV128(source_fixed_addr) => {
+            assert!(bits == BitSize::DQWORD);
+            ctx.builder.load_fixed_v128(source_fixed_addr);
+            ctx.builder.store_unaligned_v128(0);
+        },
+        GenSafeWriteValue::V128(local) => {
+            assert!(bits == BitSize::DQWORD);
+            ctx.builder.get_local_v128(local);
+            ctx.builder.store_unaligned_v128(0);
         },
     }
     match bits {
@@ -1053,20 +1467,39 @@ pub fn gen_safe_read_write(
     //   mem[(entry & ~0xFFF) ^ addr] <- value
 
     let cont = ctx.builder.block_void();
-    let (entry_local, common) = gen_memory_guard(ctx, address_local, true, true);
-
-    if bits != BitSize::BYTE {
-        ctx.builder.get_local(&address_local);
-        ctx.builder.const_i32(0xFFF);
-        ctx.builder.and_i32();
-        ctx.builder.const_i32(0x1000 - bits.bytes() as i32);
-        ctx.builder.le_i32();
-        ctx.builder.and_i32();
-    }
-
-    let can_use_fast_path_local = ctx.builder.tee_new_local();
-
-    ctx.builder.br_if(cont);
+    let (entry_local, common, can_use_fast_path_local) =
+        if let Some((entry, perm)) = gen_common_memory_guard(ctx, address_local) {
+            let can_use_fast_path_local = if bits == BitSize::BYTE {
+                // A single byte never crosses a page; read+write permission suffices.
+                gen_perm_mask_test(ctx, &perm, 3);
+                ctx.builder.tee_new_local()
+            }
+            else {
+                // Span bits: this and the next page are both readable+writable,
+                // so no page-boundary check is needed at all.
+                gen_perm_mask_test(ctx, &perm, 12);
+                let l = ctx.builder.tee_new_local();
+                ctx.builder.br_if(cont);
+                gen_perm_mask_test(ctx, &perm, 3);
+                gen_within_page_test(ctx, address_local, bits.bytes() as i32);
+                ctx.builder.and_i32();
+                ctx.builder.tee_local(&l);
+                l
+            };
+            ctx.builder.br_if(cont);
+            ctx.builder.free_local(perm);
+            (entry, true, can_use_fast_path_local)
+        }
+        else {
+            let (entry, common) = gen_memory_guard(ctx, address_local, true, true);
+            if bits != BitSize::BYTE {
+                gen_within_page_test(ctx, address_local, bits.bytes() as i32);
+                ctx.builder.and_i32();
+            }
+            let can_use_fast_path_local = ctx.builder.tee_new_local();
+            ctx.builder.br_if(cont);
+            (entry, common, can_use_fast_path_local)
+        };
 
     if cfg!(feature = "profiler") {
         ctx.builder.get_local(&address_local);
@@ -1113,7 +1546,34 @@ pub fn gen_safe_read_write(
         ctx.builder.and_i32();
     }
 
-    ctx.builder.br_if(ctx.exit_with_fault_label);
+    if gen_vec_has_dirty(ctx) || ctx.fault_precharge.is_some() {
+        ctx.builder.if_void();
+        gen_vec_flush_for_cold_path(ctx);
+        if let Some(k) = ctx.fault_precharge {
+            // On a real CPU exception (bit 1 of the slow helper's exit code)
+            // undo the pre-charge for the instructions after the faulting one;
+            // the interpreter counts the faulting instruction as retired. A
+            // bail (bit 1 clear, e.g. SMC) keeps the full pre-charge exactly as
+            // before. gen_update_instruction_counter publishes the local.
+            if k > 1 {
+                ctx.builder.get_local(&ctx.instruction_counter);
+                ctx.builder.const_i32(k as i32 - 1);
+                ctx.builder.get_local(&entry_local);
+                ctx.builder.const_i32(1);
+                ctx.builder.shr_u_i32();
+                ctx.builder.const_i32(1);
+                ctx.builder.and_i32();
+                ctx.builder.mul_i32();
+                ctx.builder.sub_i32();
+                ctx.builder.set_local(&ctx.instruction_counter);
+            }
+        }
+        ctx.builder.br(ctx.exit_with_fault_label);
+        ctx.builder.block_end();
+    }
+    else {
+        ctx.builder.br_if(ctx.exit_with_fault_label);
+    }
     if common {
         gen_resolved_memory_address(ctx, &entry_local, address_local, false);
         ctx.builder.set_local(&entry_local);
@@ -1470,6 +1930,7 @@ pub fn gen_task_switch_test(ctx: &mut JitContext) {
 
     ctx.builder.if_void();
     {
+        gen_vec_flush_for_cold_path(ctx);
         gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
         gen_fn1_const(
             ctx.builder,
@@ -1497,6 +1958,7 @@ pub fn gen_task_switch_test_mmx(ctx: &mut JitContext) {
 
     ctx.builder.if_void();
     {
+        gen_vec_flush_for_cold_path(ctx);
         gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
         gen_fn1_const(
             ctx.builder,
@@ -1775,7 +2237,7 @@ pub fn gen_getzf(ctx: &mut JitContext, negate: ConditionNegate) {
                 ctx.builder.eqz_i32();
             }
         },
-        Instruction::Bitwise { opsize, .. } => {
+        Instruction::Bitwise { opsize, .. } | Instruction::Test { opsize, .. } => {
             let &opsize = opsize;
             gen_profiler_stat_increment(ctx.builder, profiler::stat::CONDITION_OPTIMISED);
             // Note: Necessary because test{8,16} don't mask either last_result or any of their operands
@@ -1795,7 +2257,7 @@ pub fn gen_getzf(ctx: &mut JitContext, negate: ConditionNegate) {
                 ctx.builder.eqz_i32();
             }
         },
-        &Instruction::Other => {
+        Instruction::Other | Instruction::Preserve { .. } => {
             gen_profiler_stat_increment(ctx.builder, profiler::stat::CONDITION_UNOPTIMISED);
             gen_get_flags_changed(ctx.builder);
             ctx.builder.const_i32(FLAG_ZERO);
@@ -1880,7 +2342,7 @@ pub fn gen_getcf(ctx: &mut JitContext, negate: ConditionNegate) {
                 ctx.builder.eqz_i32();
             }
         },
-        Instruction::Bitwise { .. } => {
+        Instruction::Bitwise { .. } | Instruction::Test { .. } => {
             gen_profiler_stat_increment(ctx.builder, profiler::stat::CONDITION_OPTIMISED);
             ctx.builder
                 .const_i32(if negate == ConditionNegate::True { 1 } else { 0 });
@@ -1894,7 +2356,7 @@ pub fn gen_getcf(ctx: &mut JitContext, negate: ConditionNegate) {
                 ctx.builder.eqz_i32();
             }
         },
-        &Instruction::Other => {
+        Instruction::Other | Instruction::Preserve { .. } => {
             gen_profiler_stat_increment(ctx.builder, profiler::stat::CONDITION_UNOPTIMISED);
 
             gen_get_flags_changed(ctx.builder);
@@ -1941,6 +2403,7 @@ pub fn gen_getsf(ctx: &mut JitContext, negate: ConditionNegate) {
         | Instruction::Add { opsize, .. }
         | Instruction::AdcSbb { opsize, .. }
         | Instruction::Bitwise { opsize, .. }
+        | Instruction::Test { opsize, .. }
         | Instruction::NonZeroShift { opsize, .. } => {
             let &opsize = opsize;
             gen_profiler_stat_increment(ctx.builder, profiler::stat::CONDITION_OPTIMISED);
@@ -1964,7 +2427,7 @@ pub fn gen_getsf(ctx: &mut JitContext, negate: ConditionNegate) {
                 }
             }
         },
-        &Instruction::Other => {
+        Instruction::Other | Instruction::Preserve { .. } => {
             gen_profiler_stat_increment(ctx.builder, profiler::stat::CONDITION_UNOPTIMISED);
             gen_get_flags_changed(ctx.builder);
             ctx.builder.const_i32(FLAG_SIGN);
@@ -2045,7 +2508,7 @@ pub fn gen_getof(ctx: &mut JitContext) {
             });
             ctx.builder.and_i32();
         },
-        Instruction::Bitwise { .. } => {
+        Instruction::Bitwise { .. } | Instruction::Test { .. } => {
             gen_profiler_stat_increment(ctx.builder, profiler::stat::CONDITION_OPTIMISED);
             ctx.builder.const_i32(0);
         },
@@ -2055,7 +2518,7 @@ pub fn gen_getof(ctx: &mut JitContext) {
             ctx.builder.const_i32(FLAG_OVERFLOW);
             ctx.builder.and_i32();
         },
-        &Instruction::Other => {
+        Instruction::Other | Instruction::Preserve { .. } => {
             gen_profiler_stat_increment(ctx.builder, profiler::stat::CONDITION_UNOPTIMISED);
             gen_get_flags_changed(ctx.builder);
             let flags_changed = ctx.builder.tee_new_local();
@@ -2187,7 +2650,7 @@ pub fn gen_test_be(ctx: &mut JitContext, negate: ConditionNegate) {
                 ctx.builder.leu_i32();
             }
         },
-        &Instruction::Bitwise { .. } => {
+        &Instruction::Bitwise { .. } | &Instruction::Test { .. } => {
             gen_profiler_stat_increment(ctx.builder, profiler::stat::CONDITION_OPTIMISED);
             gen_getzf(ctx, negate);
         },
@@ -2201,7 +2664,10 @@ pub fn gen_test_be(ctx: &mut JitContext, negate: ConditionNegate) {
                 ctx.builder.eqz_i32();
             }
         },
-        Instruction::Other | Instruction::NonZeroShift { .. } | Instruction::AdcSbb { .. } => {
+        Instruction::Other
+        | Instruction::Preserve { .. }
+        | Instruction::NonZeroShift { .. }
+        | Instruction::AdcSbb { .. } => {
             gen_profiler_stat_increment(ctx.builder, profiler::stat::CONDITION_UNOPTIMISED);
             gen_getcf(ctx, ConditionNegate::False);
             gen_getzf(ctx, ConditionNegate::False);
@@ -2313,11 +2779,12 @@ pub fn gen_test_l(ctx: &mut JitContext, negate: ConditionNegate) {
                 ctx.builder.lt_i32();
             }
         },
-        &Instruction::Bitwise { .. } => {
+        &Instruction::Bitwise { .. } | &Instruction::Test { .. } => {
             gen_profiler_stat_increment(ctx.builder, profiler::stat::CONDITION_OPTIMISED);
             gen_getsf(ctx, negate);
         },
         &Instruction::Other
+        | Instruction::Preserve { .. }
         | Instruction::Add { .. }
         | Instruction::NonZeroShift { .. }
         | Instruction::AdcSbb { .. } => {
@@ -2440,7 +2907,7 @@ pub fn gen_test_le(ctx: &mut JitContext, negate: ConditionNegate) {
                 ctx.builder.le_i32();
             }
         },
-        &Instruction::Bitwise { .. } => {
+        &Instruction::Bitwise { .. } | &Instruction::Test { .. } => {
             gen_profiler_stat_increment(ctx.builder, profiler::stat::CONDITION_OPTIMISED);
             // TODO: Could probably be improved (<= 0)
             gen_test_l(ctx, ConditionNegate::False);
@@ -2451,6 +2918,7 @@ pub fn gen_test_le(ctx: &mut JitContext, negate: ConditionNegate) {
             }
         },
         Instruction::Other
+        | Instruction::Preserve { .. }
         | Instruction::Add { .. }
         | Instruction::NonZeroShift { .. }
         | Instruction::AdcSbb { .. } => {
@@ -2559,6 +3027,7 @@ pub fn gen_fpu_load_i64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
 }
 
 pub fn gen_trigger_de(ctx: &mut JitContext) {
+    gen_vec_flush_for_cold_path(ctx);
     gen_fn1_const(
         ctx.builder,
         "trigger_de_jit",
@@ -2569,6 +3038,7 @@ pub fn gen_trigger_de(ctx: &mut JitContext) {
 }
 
 pub fn gen_trigger_ud(ctx: &mut JitContext) {
+    gen_vec_flush_for_cold_path(ctx);
     gen_fn1_const(
         ctx.builder,
         "trigger_ud_jit",
@@ -2579,6 +3049,7 @@ pub fn gen_trigger_ud(ctx: &mut JitContext) {
 }
 
 pub fn gen_trigger_gp(ctx: &mut JitContext, error_code: u32) {
+    gen_vec_flush_for_cold_path(ctx);
     gen_fn2_const(
         ctx.builder,
         "trigger_gp_jit",

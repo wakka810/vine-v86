@@ -5,14 +5,14 @@ import path from "node:path";
 import assert from "node:assert/strict";
 import url from "node:url";
 import { spawnSync } from "node:child_process";
-import wabt from "../../build/libwabt.cjs";
+import wabt from "../../build/libwabt-1.0.39.cjs";
 
 const __dirname = url.fileURLToPath(new URL(".", import.meta.url));
 
 const TEST_RELEASE_BUILD = +process.env.TEST_RELEASE_BUILD;
 const { V86 } = await import(TEST_RELEASE_BUILD ? "../../build/libv86.mjs" : "../../src/main.js");
 
-const libwabt = wabt();
+const libwabt = await wabt();
 
 const TEST_NAME = process.env.TEST_NAME;
 

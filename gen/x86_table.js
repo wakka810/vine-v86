@@ -72,8 +72,8 @@ const encodings = [
     { opcode: 0x3E, prefix: 1 },
     { opcode: 0x3F, mask_flags: of | sf | pf | zf },
 
-    { opcode: 0x60, os: 1, block_boundary: 1 }, // pusha
-    { opcode: 0x61, os: 1, block_boundary: 1 }, // popa
+    { opcode: 0x60, os: 1, custom: 1 }, // pusha
+    { opcode: 0x61, os: 1, custom: 1 }, // popa
     { opcode: 0x62, e: 1, skip: 1 },
     { opcode: 0x63, e: 1, block_boundary: 1 }, // arpl
     { opcode: 0x64, prefix: 1 },
@@ -667,7 +667,7 @@ const encodings = [
     { sse: 1, opcode: 0x660F75, e: 1, custom: 1 },
     { sse: 1, opcode: 0x0F76, e: 1, custom: 1 },
     { sse: 1, opcode: 0x660F76, e: 1, custom: 1 },
-    { sse: 1, opcode: 0x0F77, skip: 1 }, // emms (skip as it breaks gdb printing of float registers)
+    { sse: 1, opcode: 0x0F77, skip: 1, custom: 1 }, // emms (skip as it breaks gdb printing of float registers)
 
     // vmx instructions
     { opcode: 0x0F78, skip: 1, block_boundary: 1 },
@@ -761,7 +761,7 @@ const encodings = [
     { sse: 1, opcode: 0xF20FE6, e: 1, custom: 1 },
     { sse: 1, opcode: 0xF30FE6, e: 1, custom: 1 },
     { sse: 1, opcode: 0x0FE6, e: 1, block_boundary: 1 }, // ud
-    { sse: 1, opcode: 0x0FE7, e: 1, reg_ud: 1 },
+    { sse: 1, opcode: 0x0FE7, e: 1, reg_ud: 1, custom: 1 },
     { sse: 1, opcode: 0x660FE7, e: 1, reg_ud: 1, custom: 1 },
 
     { sse: 1, opcode: 0x0FE8, e: 1, custom: 1 },

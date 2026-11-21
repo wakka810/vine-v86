@@ -305,6 +305,14 @@ static mut vine_execution_active: bool = false;
 pub unsafe fn vine_execution_is_active() -> bool { vine_execution_active }
 static mut vine_validated_execute_page: u32 = u32::MAX;
 static mut vine_stop_reason: u32 = 0;
+// Pairs of (EIP, ESP) at which an exact budget stopped the interpreter
+// mid-block; a resume at such a pair must not create a JIT entry point (it
+// would split a hot block). ESP distinguishes guest threads. A stale pair
+// can at most suppress one entry-point recording later; it never changes
+// what executes.
+static mut vine_unnatural_resumes: [(u32, u32); 16] = [(u32::MAX, u32::MAX); 16];
+static mut vine_unnatural_resume_next: usize = 0;
+static mut vine_unnatural_resumes_live: usize = 0;
 static mut vine_stop_error_code: i32 = -1;
 static mut vine_jit_instruction_limit_value: u32 = u32::MAX;
 static mut vine_jit_retired_instructions: u64 = 0;
@@ -2338,6 +2346,113 @@ pub unsafe fn vine_rearm_dirty_page(address: u32) -> u32 {
 }
 
 #[no_mangle]
+pub unsafe fn vine_invalidate_tlb_range(base: u32, byte_length: u32) -> u32 {
+    if base & 0xFFF != 0 || byte_length == 0 || byte_length & 0xFFF != 0 || vine_execution_active {
+        return 1;
+    }
+    let end = u64::from(base) + u64::from(byte_length);
+    if end > 0x1_0000_0000 {
+        return 1;
+    }
+    let start_page = base >> 12;
+    let end_page = (end >> 12) as u32;
+    let last_eip_page = *last_virt_eip as u32 >> 12;
+    if *last_virt_eip != -1 && last_eip_page >= start_page && last_eip_page < end_page {
+        *last_virt_eip = -1;
+    }
+    let mut write = 0;
+    for i in 0..valid_tlb_entries_count {
+        let page = valid_tlb_entries[i as usize];
+        let page_u32 = page as u32;
+        if page_u32 >= start_page && page_u32 < end_page {
+            clear_tlb_code(page);
+            tlb_data[page_u32 as usize] = 0;
+        }
+        else {
+            valid_tlb_entries[write as usize] = page;
+            write += 1;
+        }
+    }
+    valid_tlb_entries_count = write;
+    0
+}
+
+#[no_mangle]
+pub unsafe fn vine_protect_pte_range(base: u32, byte_length: u32, read: u32, write: u32) -> u32 {
+    if base & 0xFFF != 0
+        || byte_length == 0
+        || byte_length & 0xFFF != 0
+        || vine_execution_active
+        || read > 1
+        || write > 1
+    {
+        return 1;
+    }
+    let end = u64::from(base) + u64::from(byte_length);
+    if end > 0x8000_0000 {
+        return 1;
+    }
+    if *cr & CR0_PG == 0 || *cr.add(4) & CR4_PAE != 0 {
+        return 1;
+    }
+    let cr3 = *cr.add(3) as u32 & !0xFFF;
+    let start_page = base >> 12;
+    let end_page = (end >> 12) as u32;
+    // Validate the entire range before writing anything: a failure late in the
+    // range must leave every PTE bit-identical and the TLB untouched.
+    let mut cached_dir = u32::MAX;
+    let mut table_base = 0u32;
+    for page in start_page..end_page {
+        let dir = page >> 10;
+        if dir != cached_dir {
+            let pde = memory::read32s(cr3 + (dir << 2)) as u32;
+            if pde & 1 == 0 {
+                return 1;
+            }
+            cached_dir = dir;
+            table_base = pde & !0xFFF;
+        }
+        if memory::read32s(table_base + ((page & 0x3FF) << 2)) == 0 {
+            return 1;
+        }
+    }
+    let mut cached_dir = u32::MAX;
+    let mut table_base = 0u32;
+    let mut table_mapped = false;
+    let mut table_dirtied = false;
+    let new_bits = u32::from(read != 0 || write != 0) | (u32::from(write != 0) << 1);
+    for page in start_page..end_page {
+        let dir = page >> 10;
+        if dir != cached_dir {
+            // Pass one verified every PDE in the range is present.
+            let pde = memory::read32s(cr3 + (dir << 2)) as u32;
+            cached_dir = dir;
+            table_base = pde & !0xFFF;
+            table_mapped = memory::in_mapped_range(table_base);
+            table_dirtied = false;
+        }
+        let pte_addr = table_base + ((page & 0x3FF) << 2);
+        let pte = memory::read32s(pte_addr) as u32;
+        let updated = (pte & !3) | new_bits;
+        if updated != pte {
+            if table_mapped {
+                memory::write32(pte_addr, updated as i32);
+            }
+            else {
+                // All PTEs of this table share one physical page, so a single
+                // dirty check covers every write to it.
+                if !table_dirtied {
+                    jit::jit_dirty_cache_small(pte_addr, pte_addr + 4);
+                    table_dirtied = true;
+                }
+                memory::write32_no_mmap_or_dirty_check(pte_addr, updated as i32);
+            }
+        }
+    }
+    vine_invalidate_tlb_range(base, byte_length)
+}
+
+#[no_mangle]
 pub unsafe fn clear_tlb() {
     profiler::stat_increment(stat::CLEAR_TLB);
     // clear tlb excluding global pages
@@ -3104,6 +3219,7 @@ unsafe fn run_interpreted_with_budget(
     initial_eip: i32,
     initial_state_flags: CachedStateFlags,
     allow_cached_entry: bool,
+    record_entry: bool,
 ) {
     *previous_ip = initial_eip;
     let phys_addr = return_on_pagefault!(get_phys_eip());
@@ -3141,6 +3257,7 @@ unsafe fn run_interpreted_with_budget(
         get_seg_cs() as u32,
         initial_state_flags,
         *instruction_counter - initial_instruction_counter,
+        record_entry,
     );
 
     profiler::stat_increment_by(
@@ -3158,6 +3275,19 @@ unsafe fn cycle_internal_with_budget(interpreter_budget: u32) {
     let mut jit_entry = None;
     let initial_eip = *instruction_pointer;
     let initial_state_flags = *state_flags;
+    let resume_pair = (initial_eip as u32, read_reg32(ESP) as u32);
+    let mut unnatural_resume = false;
+    if vine_unnatural_resumes_live != 0 {
+        for i in 0..16 {
+            if vine_unnatural_resumes[i] == resume_pair {
+                vine_unnatural_resumes[i] = (u32::MAX, u32::MAX);
+                if resume_pair != (u32::MAX, u32::MAX) {
+                    vine_unnatural_resumes_live -= 1;
+                }
+                unnatural_resume = true;
+            }
+        }
+    }
 
     match tlb_code[(initial_eip as u32 >> 12) as usize] {
         None => {},
@@ -3236,7 +3366,7 @@ unsafe fn cycle_internal_with_budget(interpreter_budget: u32) {
             // retires nothing; force one interpreter instruction so we cannot
             // repeatedly redispatch the same oversized block without progress.
             if vine_stop_reason == 0 && !*in_hlt {
-                run_interpreted_with_budget(1, *instruction_pointer, *state_flags, false);
+                run_interpreted_with_budget(1, *instruction_pointer, *state_flags, false, true);
             }
             return;
         }
@@ -3283,6 +3413,7 @@ unsafe fn cycle_internal_with_budget(interpreter_budget: u32) {
             initial_eip,
             initial_state_flags,
             allow_cached_entry,
+            !unnatural_resume,
         );
     };
 }
@@ -3335,6 +3466,19 @@ unsafe fn jit_run_interpreted(mut phys_addr: u32, instruction_limit: u32) {
             || (i >= INTERPRETER_ITERATION_LIMIT
                 && (start_eip as u32) >= (*instruction_pointer as u32))
         {
+            if i >= instruction_limit
+                && !jit_block_boundary
+                && vine_stop_reason == 0
+                && Page::page_of(start_eip as u32) == Page::page_of(*instruction_pointer as u32)
+            {
+                let slot = vine_unnatural_resume_next;
+                if vine_unnatural_resumes[slot] == (u32::MAX, u32::MAX) {
+                    vine_unnatural_resumes_live += 1;
+                }
+                vine_unnatural_resumes[slot] =
+                    (*instruction_pointer as u32, read_reg32(ESP) as u32);
+                vine_unnatural_resume_next = (slot + 1) & 15;
+            }
             break;
         }
 
@@ -3764,6 +3908,21 @@ pub fn report_safe_read_write_jit_slow(address: u32, entry: i32) {
 struct ScratchBuffer([u8; 0x1000 * 2]);
 static mut jit_paging_scratch_buffer: ScratchBuffer = ScratchBuffer([0; 2 * 0x1000]);
 
+/// Exit code returned by the safe_{read,write}_slow_jit family. Bit 0 tells the
+/// generated code to leave the jit module. Bit 1 distinguishes a real CPU
+/// exception, for which the interpreter charges the faulting instruction as
+/// retired, from a silent bail (e.g. self-modifying code: the instruction is
+/// re-executed interpreted). The jit uses bit 1 to correct the basic block's
+/// pre-charged instruction count on fault exits.
+unsafe fn jit_safe_exit_code() -> i32 {
+    if let JitExitReason::CpuException { .. } = jit_exit_reason {
+        3
+    }
+    else {
+        1
+    }
+}
+
 pub unsafe fn safe_read_slow_jit(
     addr: i32,
     bitsize: i32,
@@ -3784,7 +3943,7 @@ pub unsafe fn safe_read_slow_jit(
     } {
         Err(()) => {
             *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
-            return 1;
+            return jit_safe_exit_code();
         },
         Ok(addr) => addr,
     };
@@ -3798,7 +3957,7 @@ pub unsafe fn safe_read_slow_jit(
         } {
             Err(()) => {
                 *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
-                return 1;
+                return jit_safe_exit_code();
             },
             Ok(addr) => addr,
         };
@@ -3908,7 +4067,7 @@ pub unsafe fn readable_or_pagefault_jit(addr: i32, size: i32, eip_offset_in_page
     dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
     let crosses_page = (addr & 0xFFF) + size > 0x1000;
     if translate_address_read_jit(addr).is_err()
-        || crosses_page && translate_address_read_jit((addr | 0xFFF) + 1).is_err()
+        || crosses_page && translate_address_read_jit((addr | 0xFFF).wrapping_add(1)).is_err()
     {
         *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
         return 1;
@@ -3932,7 +4091,7 @@ pub unsafe fn safe_write_slow_jit(
     let addr_low = match translate_address_write_jit(addr, wasm_table_index) {
         Err(()) => {
             *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
-            return 1;
+            return jit_safe_exit_code();
         },
         Ok(x) => x,
     };
@@ -3940,7 +4099,7 @@ pub unsafe fn safe_write_slow_jit(
         let addr_high = match translate_address_write_jit((addr | 0xFFF) + 1, wasm_table_index) {
             Err(()) => {
                 *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
-                return 1;
+                return jit_safe_exit_code();
             },
             Ok(x) => x,
         };
@@ -4036,11 +4195,88 @@ pub unsafe fn writable_or_pagefault_jit(
     let crosses_page = (addr & 0xFFF) + size > 0x1000;
     if translate_address_write_jit(addr, wasm_table_index).is_err()
         || crosses_page
-            && translate_address_write_jit((addr | 0xFFF) + 1, wasm_table_index).is_err()
+            && translate_address_write_jit((addr | 0xFFF).wrapping_add(1), wasm_table_index)
+                .is_err()
     {
         *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
         return 1;
     }
+    0
+}
+
+#[no_mangle]
+pub unsafe fn pusha16_jit(eip_offset_in_page_and_wasm_table_index: i32) -> i32 {
+    if writable_or_pagefault_jit(
+        get_stack_pointer(-16),
+        16,
+        eip_offset_in_page_and_wasm_table_index,
+    ) != 0
+    {
+        return 1;
+    }
+    let temp = read_reg16(SP);
+    push16(read_reg16(AX)).unwrap();
+    push16(read_reg16(CX)).unwrap();
+    push16(read_reg16(DX)).unwrap();
+    push16(read_reg16(BX)).unwrap();
+    push16(temp as i32).unwrap();
+    push16(read_reg16(BP)).unwrap();
+    push16(read_reg16(SI)).unwrap();
+    push16(read_reg16(DI)).unwrap();
+    0
+}
+
+#[no_mangle]
+pub unsafe fn pusha32_jit(eip_offset_in_page_and_wasm_table_index: i32) -> i32 {
+    if writable_or_pagefault_jit(
+        get_stack_pointer(-32),
+        32,
+        eip_offset_in_page_and_wasm_table_index,
+    ) != 0
+    {
+        return 1;
+    }
+    let temp = read_reg32(ESP);
+    push32(read_reg32(EAX)).unwrap();
+    push32(read_reg32(ECX)).unwrap();
+    push32(read_reg32(EDX)).unwrap();
+    push32(read_reg32(EBX)).unwrap();
+    push32(temp).unwrap();
+    push32(read_reg32(EBP)).unwrap();
+    push32(read_reg32(ESI)).unwrap();
+    push32(read_reg32(EDI)).unwrap();
+    0
+}
+
+#[no_mangle]
+pub unsafe fn popa16_jit(eip_offset_in_page: i32) -> i32 {
+    if readable_or_pagefault_jit(get_stack_pointer(0), 16, eip_offset_in_page) != 0 {
+        return 1;
+    }
+    write_reg16(DI, pop16().unwrap());
+    write_reg16(SI, pop16().unwrap());
+    write_reg16(BP, pop16().unwrap());
+    adjust_stack_reg(2);
+    write_reg16(BX, pop16().unwrap());
+    write_reg16(DX, pop16().unwrap());
+    write_reg16(CX, pop16().unwrap());
+    write_reg16(AX, pop16().unwrap());
+    0
+}
+
+#[no_mangle]
+pub unsafe fn popa32_jit(eip_offset_in_page: i32) -> i32 {
+    if readable_or_pagefault_jit(get_stack_pointer(0), 32, eip_offset_in_page) != 0 {
+        return 1;
+    }
+    write_reg32(EDI, pop32s().unwrap());
+    write_reg32(ESI, pop32s().unwrap());
+    write_reg32(EBP, pop32s().unwrap());
+    adjust_stack_reg(4);
+    write_reg32(EBX, pop32s().unwrap());
+    write_reg32(EDX, pop32s().unwrap());
+    write_reg32(ECX, pop32s().unwrap());
+    write_reg32(EAX, pop32s().unwrap());
     0
 }
 

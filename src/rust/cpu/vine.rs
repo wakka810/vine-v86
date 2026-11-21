@@ -81,6 +81,13 @@ pub unsafe fn common_memory() -> Option<(u32, u32)> {
     }
 }
 
+pub fn execute_protection_pointers() -> (u32, u32) {
+    (
+        (&raw const EXECUTE_PROTECTION_ENABLED) as u32,
+        (&raw const EXECUTE_BITMAP).cast::<u8>() as u32,
+    )
+}
+
 pub unsafe fn invalidate_common_page(page: Option<u32>) {
     assert!(!crate::cpu::cpu::vine_execution_is_active());
     match page {
@@ -92,6 +99,12 @@ pub unsafe fn invalidate_common_page(page: Option<u32>) {
     }
 }
 
+pub unsafe fn protect_common_range(base: u32, byte_length: u32, read: bool, write: bool) -> bool {
+    assert!(!crate::cpu::cpu::vine_execution_is_active());
+    crate::cpu::cpu::vine_protect_pte_range(base, byte_length, u32::from(read), u32::from(write))
+        == 0
+}
+
 #[no_mangle]
 pub unsafe fn vine_set_common_fastmem(enabled: u32) -> u32 {
     if enabled > 1 || crate::cpu::cpu::vine_execution_is_active() {
@@ -101,6 +114,23 @@ pub unsafe fn vine_set_common_fastmem(enabled: u32) -> u32 {
         crate::jit::jit_clear_cache_js();
         COMMON_FASTMEM = enabled != 0;
     }
+    0
+}
+
+/// Selects the common-memory arena and its per-linear-page permission table
+/// for builds where no statically linked Runtime installs them (tests).
+/// Set-once: in the product the Runtime binds memory in `vine_shared_bind_cpu`
+/// through `set_common_memory` before any JS can call this export, so it is
+/// inert there; the fallback test harness calls it once on a fresh instance.
+#[no_mangle]
+pub unsafe fn vine_set_common_memory(base: u32, permissions: u32) -> u32 {
+    if permissions == 0
+        || matches!(COMMON_MEMORY, Some(_))
+        || crate::cpu::cpu::vine_execution_is_active()
+    {
+        return 1;
+    }
+    set_common_memory(base, permissions);
     0
 }
 
@@ -299,6 +329,31 @@ pub unsafe fn vine_cpu_state_restore() -> u32 {
         return 2;
     }
 
+    let mut tlb_compatible = *cpl == get(CPL) as u8
+        && *protected_mode == (get(PROTECTED_MODE) != 0)
+        && *is_32 == (get(IS_32) != 0)
+        && *stack_size_32 == (get(STACK_SIZE_32) != 0)
+        && *cr.add(0) == get(CR_BASE) as i32
+        && *cr.add(3) == get(CR_BASE + 3) as i32
+        && *cr.add(4) == get(CR_BASE + 4) as i32;
+    if tlb_compatible {
+        for index in 0..4 {
+            let pdpte =
+                get(PDPTE_BASE + index * 2) as u64 | (get(PDPTE_BASE + index * 2 + 1) as u64) << 32;
+            let meta = get(SEGMENT_META_BASE + index);
+            if *reg_pdpte.add(index) != pdpte
+                || *sreg.add(index) != get(SREG_BASE + index) as u16
+                || *segment_offsets.add(index) != get(SEGMENT_OFFSET_BASE + index) as i32
+                || *segment_limits.add(index) != get(SEGMENT_LIMIT_BASE + index)
+                || *segment_access_bytes.add(index) != meta as u8
+                || *segment_is_null.add(index) != (meta >> 8 & 1 != 0)
+            {
+                tlb_compatible = false;
+                break;
+            }
+        }
+    }
+
     for index in 0..8 {
         *reg32.add(index) = get(GPR_BASE + index) as i32;
         *sreg.add(index) = get(SREG_BASE + index) as u16;
@@ -368,6 +423,8 @@ pub unsafe fn vine_cpu_state_restore() -> u32 {
     *last_virt_eip = -1;
     *eip_phys = 0;
     update_state_flags();
-    full_clear_tlb();
+    if !tlb_compatible {
+        full_clear_tlb();
+    }
     0
 }

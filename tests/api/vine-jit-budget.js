@@ -468,6 +468,51 @@ for(const [name, options, cold] of [
     console.log("tiny backward reentry: one interpreted jump and two cached instructions passed");
 }
 
+// A budget stop inside a tight loop records the resume EIP so the forced resume
+// cannot split the block, but it must still warm the page. Driving the loop
+// only with exact-budget slices means every entry after the first is a recorded
+// resume: the page must still reach the JIT, and no mid-block resume EIP may
+// become a compiled entry.
+{
+    const modules = [];
+    const { jit, cpus, execute } = create_pair(loops[0][1], {
+        on_finalize(_wasm, args) { modules.push({ index: args[0], flags: args[2] }); },
+    }, { compare_retired_partition: false, allow_budget_previous_eip: true });
+    // Require several slices of accumulated heat; the first entry registers the
+    // loop head, later entries are recorded resumes that only credit heat.
+    jit.wasm.set_jit_config(5, 40000);
+    for(let i = 0; i < 32 && modules.length === 0; i++)
+    {
+        const result = execute(16384, `budget-resumed loop: slice ${i}`);
+        assert.equal(result.reason, 1);
+        assert.equal(result.instructions, 16384);
+        await Promise.resolve();
+    }
+    assert.equal(modules.length, 1, "a loop driven only by budget slices must reach the JIT");
+    function cache_entry(address) {
+        return modules.some(({ index, flags }) =>
+            jit.wasm.jit_find_cache_entry_in_page(address, index, flags) >= 0);
+    }
+    assert(cache_entry(START), "the registered loop head is a compiled entry");
+    assert(!cache_entry(START + 1) && !cache_entry(START + 2),
+        "mid-block resume EIPs must not become compiled entries");
+    const result = execute(16385, "budget-resumed loop: mid-block stop");
+    assert.equal(result.reason, 1);
+    assert.equal(result.instructions, 16385);
+    const resumed = execute(4096, "budget-resumed loop: resume inside the block");
+    assert.equal(resumed.reason, 1);
+    assert.equal(resumed.instructions, 4096);
+    assert(!cache_entry(START + 1) && !cache_entry(START + 2),
+        "a recorded resume at a mid-block EIP must not become an entry");
+    const before = jit.full_snapshot();
+    const warmed = execute(8192, "budget-resumed loop: compiled slice");
+    const after = jit.full_snapshot();
+    assert(after.jit - before.jit > 0n, "the resumed loop must execute compiled code");
+    assert_budget_architecture(jit, cpus[1], "budget-resumed loop");
+    jit.assert_hoisted();
+    console.log("budget-resumed loop: heat without entry registration reached the JIT, mid-block EIPs stayed cold");
+}
+
 // Rejecting a too-large compiled block must retry a self-modifying store exactly
 // once. The target is in the same executable page but outside the running loop.
 {
@@ -1247,4 +1292,50 @@ for(const asynchronous of [false, true]) {
         if(pair.baseline) pair.baseline.assert_hoisted();
     }
     console.log(`SBB alias focused: ${cases} compiled cases, alias/nonalias and both carry inputs.`);
+}
+
+// A protect range that fails partway through must not leave half-rewritten
+// PTEs: the whole range is validated before any PTE is written, and the TLB
+// invalidation only runs after a fully successful update.
+{
+    const cpu = create_cpu([0x40, 0xeb, 0xfd], { paging: true });
+    const physical = cpu.physical;
+    const pte = index => PAGE_TABLE + index * 4;
+    const snapshot = count => Array.from({ length: count },
+        (_, i) => physical.getUint32(pte(i), true));
+    // Fill the rest of the directory entry so the absent-PDE case is reached
+    // only after a full table of valid PTEs.
+    for(let index = 256; index < 1024; index++)
+        physical.setUint32(pte(index), index << 12 | 7, true);
+
+    // A range whose last page has no PTE fails before rewriting anything.
+    physical.setUint32(pte(3), 0, true);
+    const zeroed = snapshot(4);
+    assert.notEqual(cpu.wasm.vine_protect_pte_range(VIRTUAL_BASE, 4 * 4096, 1, 0), 0,
+        "a zero PTE in the range rejects the call");
+    assert.deepEqual(snapshot(4), zeroed, "a failed protect rewrites no PTE");
+
+    // A range with an absent PDE after 1024 valid pages fails the same way.
+    // Restore the zeroed PTE so the failure can only come from the absent
+    // second page directory entry past the first table's 4 MiB span.
+    physical.setUint32(pte(3), 3 << 12 | 7, true);
+    for(let index = 0; index < 1024; index++)
+    {
+        assert.notEqual(physical.getUint32(pte(index), true), 0,
+            `PTE ${index} must be valid before the absent-PDE case`);
+    }
+    const table_before = snapshot(1024);
+    assert.notEqual(cpu.wasm.vine_protect_pte_range(VIRTUAL_BASE, 8 * 1024 * 4096, 1, 0), 0,
+        "an absent PDE inside the range rejects the call");
+    assert.deepEqual(snapshot(1024), table_before,
+        "a late PDE failure rewrites no earlier PTE");
+
+    // A fully valid range still applies its new bits.
+    assert.equal(cpu.wasm.vine_protect_pte_range(VIRTUAL_BASE, 4 * 4096, 1, 0), 0);
+    for(let index = 0; index < 4; index++)
+    {
+        assert.equal(physical.getUint32(pte(index), true), index << 12 | 5,
+            "the following valid protect strips the write bit");
+    }
+    console.log("protect PTE range: late PTE/PDE failures rewrite nothing, valid call still works");
 }

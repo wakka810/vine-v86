@@ -578,3 +578,308 @@ console.log(`x87 RAM INC/DEC: ${rmw_cases} independent flag/value cases, aliases
  assert.equal(compare_conversion(cpus,100,"split run second load fault",true).reason,0x10e);
 }
 console.log("x87 split load/arithmetic: both entries, exact budgets, second read and later store faults passed");
+
+// ===== Typed f64 twin (JIT config index 10) =====
+// The typed twin must produce bit-identical architectural state to the
+// dynamic value-run sequence and the helper/interpreter paths for every
+// input, including every bail kind at every position inside a run.
+assert.equal(create_cpu([0xff,0xe1]).wasm.get_jit_config(10),1,"typed twin defaults on");
+function typed_cpus(bytes,paging=true){
+ const all=conversion_cpus(bytes,paging);
+ const off=create_cpu(bytes,{paging});
+ off.wasm.set_jit_config(10,0);
+ off.wasm.vine_set_x87_mode(3);
+ all.push(off);
+ return all;
+}
+// Write a raw80 slot holding an ordinary binary64 so entry recovery publishes
+// the SHADOW form the typed twin accepts.
+function slot80(view,register,x){
+ const bits=new BigUint64Array(new Float64Array([x]).buffer)[0];
+ const exponent=Number(bits>>52n&0x7ffn);
+ if(exponent===0)view.setBigUint64(1152+register*16,0n,true);
+ else view.setBigUint64(1152+register*16,(bits&0xfffffffffffffn)<<11n|1n<<63n,true);
+ view.setUint16(1160+register*16,Number(bits>>63n)<<15|(exponent===0?0:exponent+0x3c00),true);
+}
+function seed_full(cpu,st,top=4){
+ seed(cpu);
+ const view=new DataView(cpu.wasm.memory.buffer);
+ view.setUint8(1032,top);view.setUint8(816,0xff&~(1<<top));
+ slot80(view,top,st);
+}
+
+// MDCT-shaped butterflies: fld/fsub/fadd/fmul/fstp on m32 operands, repeated
+// in one straight-line run.
+const butterfly=[];
+for(let i=0;i<4;i++){
+ const b=i*20;
+ butterfly.push(
+  0xd9,0x47,b,      // fld  dword [bx+b]
+  0xd8,0x67,b+4,    // fsub dword [bx+b+4]   (D8 /4)
+  0xd8,0x47,b+8,    // fadd dword [bx+b+8]   (D8 /0)
+  0xd8,0x4f,b+12,   // fmul dword [bx+b+12]  (D8 /1)
+  0xd9,0x5f,b+16,   // fstp dword [bx+b+16]  (D9 /3)
+ );
+}
+{
+ const all=typed_cpus([...butterfly,0xff,0xe1]);
+ for(const c of all){
+  seed(c);c.set_register(3,0x400000+DATA);
+  for(let i=0;i<20;i++)c.physical.setFloat32(DATA+i*4,(i%7-3)*0.5+0.125*i,true);
+ }
+ for(const budget of [120000,1,2,3,4,5,7,9,13,17,21,4097])
+  compare_conversion(all,budget,"typed butterfly budget "+budget);
+ assert(all[0].wasm.vine_x87_fast_instructions()>0,"butterfly typed run executes");
+}
+console.log("x87 typed twin: m32 butterfly run, knob off parity and exact budgets passed");
+
+// Non-ordinary memory operands bail before the op mutates anything; the
+// trigger can sit at the first, a middle or the last op of the run.
+const m32_body=[0xd9,0x47,0,0xd8,0x47,4,0xd8,0x47,8,0xd8,0x47,12,0xff,0xe1];
+const m64_body=[0xdd,0x47,0,0xdc,0x47,8,0xdc,0x47,16,0xdc,0x47,24,0xff,0xe1];
+const m32_values=[Infinity,-Infinity,NaN,1e-40,0,-0];
+const m64_values=[Infinity,-Infinity,NaN,5e-324,0,-0];
+let typed_bail_cases=0;
+for(const offset of [0,4,8,12]){
+ const all=typed_cpus(m32_body);
+ for(const value of m32_values){
+  for(const c of all){
+   seed(c);c.set_register(3,0x400000+DATA);
+   for(let i=0;i<16;i+=4)c.physical.setFloat32(DATA+i,1.25+i*0.5,true);
+   c.physical.setFloat32(DATA+offset,value,true);
+  }
+  compare_conversion(all,120000,"typed m32 operand bail @"+offset+" "+value);
+  typed_bail_cases++;
+ }
+}
+for(const offset of [0,8,16,24]){
+ const all=typed_cpus(m64_body);
+ for(const value of m64_values){
+  for(const c of all){
+   seed(c);c.set_register(3,0x400000+DATA);
+   for(let i=0;i<32;i+=8)c.physical.setFloat64(DATA+i,1.25+i*0.25,true);
+   c.physical.setFloat64(DATA+offset,value,true);
+  }
+  compare_conversion(all,120000,"typed m64 operand bail @"+offset+" "+value);
+  typed_bail_cases++;
+ }
+}
+// Overflow to infinity, nonzero subnormal results and underflow-to-zero in
+// multiplication bail at the first, a middle and the last arithmetic op.
+const add_body=[0xdc,0x47,0,0xdc,0x47,8,0xdc,0x47,16,0xdd,0x5f,24,0xff,0xe1];
+const mul_body=[0xdc,0x4f,0,0xdc,0x4f,8,0xdc,0x4f,16,0xdd,0x5f,24,0xff,0xe1];
+for(const [name,body,st,vals] of [
+ ["add overflow",add_body,1e308,[[1e308,1,1],[1,1e308,1],[1,1,1e308]]],
+ ["mul overflow",mul_body,1e200,[[1e200,1,1],[1,1e200,1],[1,1,1e200]]],
+ ["mul subnormal",mul_body,2.2250738585072014e-308,[[0.5,1,1],[1,0.5,1],[1,1,0.5]]],
+ ["mul zero",mul_body,1e-200,[[1e-200,1,1],[1,1e-200,1],[1,1,1e-200]]],
+]){
+ const all=typed_cpus(body);
+ for(const [v0,v1,v2] of vals){
+  for(const c of all){
+   seed_full(c,st);c.set_register(3,0x400000+DATA);
+   c.physical.setFloat64(DATA,v0,true);c.physical.setFloat64(DATA+8,v1,true);
+   c.physical.setFloat64(DATA+16,v2,true);
+  }
+  compare_conversion(all,120000,"typed "+name+" "+v0+" "+v1+" "+v2);
+  typed_bail_cases++;
+ }
+}
+// f32 store overflow/underflow and out-of-range integer stores bail before the
+// guest store; first, middle and last store positions all resume exactly.
+const store_body=[0xdd,0x47,0,0xd9,0x5f,8,0xdd,0x47,16,0xd9,0x5f,24,0xff,0xe1];
+for(const [label,v0,v1] of [["overflow",1e300,2],["underflow",1e-300,2],
+ ["first",1e300,2],["middle",2,1e300]]){
+ const all=typed_cpus(store_body);
+ for(const c of all){
+  seed(c);c.set_register(3,0x400000+DATA);
+  c.physical.setFloat64(DATA,v0,true);c.physical.setFloat64(DATA+16,v1,true);
+ }
+ compare_conversion(all,120000,"typed f32 store "+label);
+ typed_bail_cases++;
+}
+// A store bail at literal op 0: the stack starts full and the demote fails.
+{
+ const all=typed_cpus([0xd9,0x5f,0,0xdd,0x47,8,0xdd,0x5f,16,0xff,0xe1]);
+ for(const c of all){
+  seed_full(c,1e300);c.set_register(3,0x400000+DATA);c.physical.setFloat64(DATA+8,2,true);
+ }
+ compare_conversion(all,120000,"typed f32 store bail at first op");
+ typed_bail_cases++;
+}
+const fist_body=[0xdd,0x47,0,0xdb,0x57,8,0xdc,0x47,16,0xdb,0x5f,24,0xff,0xe1];
+for(const [label,v0,v1] of [["middle",3e9,2],["last",2,3e9]]){
+ const all=typed_cpus(fist_body);
+ for(const c of all){
+  seed(c);c.set_register(3,0x400000+DATA);
+  c.physical.setFloat64(DATA,v0,true);c.physical.setFloat64(DATA+16,v1,true);
+ }
+ compare_conversion(all,120000,"typed fist bail "+label);
+ typed_bail_cases++;
+}
+{
+ const all=typed_cpus([0xdb,0x57,0,0xdd,0x47,8,0xdd,0x5f,16,0xff,0xe1]);
+ for(const c of all){
+  seed_full(c,3e9);c.set_register(3,0x400000+DATA);c.physical.setFloat64(DATA+8,2,true);
+ }
+ compare_conversion(all,120000,"typed fist bail at first op");
+ typed_bail_cases++;
+}
+// A page fault inside a typed run and budget stops at every op boundary keep
+// the original slow-path behaviour.
+{
+ const all=typed_cpus(m32_body);
+ for(const c of all){seed(c);c.set_register(3,0x400000+DATA);}
+ for(const budget of [1,2,3,4,5,6])compare_conversion(all,budget,"typed m32 budget "+budget);
+}
+{
+ const all=typed_cpus([0xd9,0x47,0,0xd8,0x47,4,0xd9,0x1b,0xff,0xe1]);
+ for(const c of all){
+  seed(c);c.set_register(3,0x400000+DATA);c.execute(120000);
+  seed(c);c.set_register(3,0x70000000);
+ }
+ assert.equal(compare_conversion(all,100,"typed interior store fault",true).reason,0x10e);
+}
+{
+ const all=typed_cpus([0xd9,0x47,0,0xd8,0x47,4,0xd8,0x1b,0xff,0xe1]);
+ for(const c of all){
+  seed(c);c.set_register(3,0x400000+DATA);c.execute(120000);
+  seed(c);c.set_register(3,0x70000000);
+ }
+ assert.equal(compare_conversion(all,100,"typed interior load fault",true).reason,0x10e);
+}
+console.log(`x87 typed twin: ${typed_bail_cases} bail cases at first/middle/last ops, knob-off parity, budgets and interior faults passed`);
+
+// ===== Round 2: shared guards, plan-limit knobs and tag masks =====
+
+// Two addresses with identical register coefficients inside one 64-byte
+// window share a single page guard. A group whose union extent straddles a
+// page boundary must fail the shared guard exactly like an individual guard
+// failure, and a write member makes the whole group require write access.
+{
+ // fld [ebx+8] fadd [ebx+24] fstp [ebx+40]: the union 0x2ff8..0x301c
+ // straddles the page boundary at 0x3000, so the run cannot start.
+ const all=typed_cpus([0xd9,0x43,8,0xd8,0x43,24,0xd9,0x5b,40,0xff,0xe1],false);
+ for(const c of all){
+  seed(c);c.set_register(3,0x2ff0);
+  c.physical.setFloat32(0x2ff8,1.5,true);c.physical.setFloat32(0x3004,2.25,true);
+ }
+ compare_conversion(all,120000,"shared guard straddling pair");
+}
+{
+ // fld [ebx+8] fstp [ebx+24] both inside the data page; protecting the page
+ // must fail the shared guard's union write check, never a silent store.
+ const all=typed_cpus([0xd9,0x43,8,0xd9,0x5b,24,0xff,0xe1],true);
+ for(const c of all){
+  seed(c);c.set_register(3,0x400000+DATA-8);
+  c.physical.setFloat32(DATA,1.5,true);c.physical.setFloat32(DATA+16,0.5,true);
+  c.protect_data_page();
+ }
+ assert.equal(compare_conversion(all,100,"shared guard non-writable member",true).reason,0x10e);
+}
+console.log("x87 shared guards: straddling group and non-writable member fall back exactly");
+
+// Plan limits are runtime knobs: index 11 = maximum ops per value run
+// (default 64, clamp 3..128), index 12 = maximum distinct addresses
+// (default 24, clamp 1..40).
+{
+ const probe=create_cpu([0xff,0xe1]);
+ assert.equal(probe.wasm.get_jit_config(11),64,"ops limit defaults to 64");
+ assert.equal(probe.wasm.get_jit_config(12),24,"address limit defaults to 24");
+ probe.wasm.set_jit_config(11,1);assert.equal(probe.wasm.get_jit_config(11),3,"ops clamp low");
+ probe.wasm.set_jit_config(11,200);assert.equal(probe.wasm.get_jit_config(11),128,"ops clamp high");
+ probe.wasm.set_jit_config(12,0);assert.equal(probe.wasm.get_jit_config(12),1,"addresses clamp low");
+ probe.wasm.set_jit_config(12,99);assert.equal(probe.wasm.get_jit_config(12),40,"addresses clamp high");
+}
+function limit_cpus(bytes,ops_limit,address_limit){
+ const all=typed_cpus(bytes,true);
+ for(const c of all){c.wasm.set_jit_config(11,ops_limit);c.wasm.set_jit_config(12,address_limit);}
+ return all;
+}
+function long_body(pairs,addresses){
+ const body=[];
+ for(let i=0;i<pairs;i++){const o=(i%addresses)*4;body.push(0xd9,0x43,o,0xd9,0x5b,o);}
+ body.push(0xff,0xe1);return body;
+}
+function seed_long(c,addresses,base=0x40000){
+ seed(c);c.set_register(3,0x400000+base);
+ for(let i=0;i<addresses*4;i+=4)c.physical.setFloat32(base+i,(i%9-4)*0.25+1,true);
+}
+// Runs longer than the default 32 ops need the raised limits: 64 ops over 24
+// distinct addresses and 96 ops over 32, exact budgets at every boundary.
+for(const [pairs,addresses,label] of [[32,24,"64 ops/24 addresses"],[48,32,"96 ops/32 addresses"]]){
+ const all=limit_cpus(long_body(pairs,addresses),pairs*2,addresses);
+ for(const c of all)seed_long(c,addresses);
+ for(const budget of [131072,1,5,7,33,65,4097])
+  compare_conversion(all,budget,"typed long "+label+" budget "+budget);
+ assert(all[0].wasm.vine_x87_fast_instructions()>0,label+" executes a fast run");
+}
+// A bail at the literal last op of a full run: the final fmul overflows to
+// infinity from two nonzero operands.
+for(const [pairs,addresses,label] of [[32,24,"64 ops"],[48,32,"96 ops"]]){
+ const last_offset=(addresses-1)*4;
+ const body=long_body(pairs-1,addresses);
+ body.splice(-2,0,0xdd,0x43,last_offset,0xd8,0xc9); // fld qword [ebx+o]; fmul st1
+ const all=limit_cpus(body,pairs*2,addresses);
+ for(const c of all){
+  seed_long(c,addresses);seed_full(c,1e308);
+  c.physical.setFloat64(0x40000+last_offset,1e308,true);
+ }
+ compare_conversion(all,131072,"typed long last-op bail "+label);
+}
+// A page fault inside a long run: the second half addresses a register that
+// is repointed at unmapped memory after compilation.
+{
+ const body=[];
+ for(let i=0;i<12;i++){const o=(i%12)*4;body.push(0xd9,0x43,o,0xd9,0x5b,o);}
+ for(let i=0;i<12;i++){const o=(i%12)*4;body.push(0xd9,0x47,o,0xd9,0x5f,o);}
+ body.push(0xff,0xe1);
+ const all=limit_cpus(body,64,24);
+ for(const c of all){
+  seed_long(c,12);c.set_register(7,0x400000+0x60000);
+  for(let i=0;i<48;i+=4)c.physical.setFloat32(0x60000+i,1.5,true);
+  c.execute(131072);
+  seed_long(c,12);c.set_register(7,0x70000000);
+ }
+ assert.equal(compare_conversion(all,100,"typed long interior fault",true).reason,0x10e);
+}
+console.log("x87 plan limits: 64-op/24-address and 96-op/32-address runs, last-op bail, budgets and interior fault passed");
+
+// A plan that does not fit the local budget re-plans once at 32 ops / 16
+// addresses rather than losing the run. The fallback cannot be forced
+// through this surface — the largest plan (40 addresses, 8 slots) still
+// needs under ~100 of the 128 local slots — so this case pins down the
+// observable contract: a run wider than the fallback limits still executes
+// a fast plan with exact parity. The re-plan branch itself was exercised
+// with a diagnostic build during development.
+{
+ const body=long_body(24,20); // 48 ops, 20 distinct addresses: >16/<32-op fallback
+ const all=typed_cpus(body);
+ for(const c of all)seed_long(c,20);
+ for(const budget of [131072,1,3,33,4097])
+  compare_conversion(all,budget,"typed re-plan parity budget "+budget);
+ assert(all[0].wasm.vine_x87_fast_instructions()>0,"re-plan candidate still executes a fast run");
+}
+
+// The rotated tag mask must be identical for every initial TOP: seed two
+// adjacent full slots and run pops, pushes and exchanges on top of them.
+function seed_two(cpu,a,b,top){
+ seed(cpu);
+ const view=new DataView(cpu.wasm.memory.buffer);
+ view.setUint8(1032,top);view.setUint8(816,0xff&~(1<<top)&~(1<<((top+1)&7)));
+ slot80(view,top,a);slot80(view,(top+1)&7,b);
+}
+let tag_cases=0;
+for(const [name,body] of [
+ ["pop+exchange",[0xdd,0xd8,0xd9,0xc9,0xff,0xe1]],              // fstp st0; fxch st1
+ ["push+pop",[0xd9,0xc1,0xde,0xc1,0xff,0xe1]],                  // fld st1; faddp st1
+ ["push+exchange+pop",[0xdd,0x47,8,0xd9,0xc9,0xde,0xc9,0xff,0xe1]], // fld [edi+8]; fxch st1; fmulp
+]){
+ for(let top=0;top<8;top++){
+  const all=typed_cpus(body);
+  for(const c of all){seed_two(c,1.25,2.5,top);c.physical.setFloat64(DATA+8,3.5,true);}
+  compare_conversion(all,120000,"typed tag parity "+name+" TOP "+top);
+  tag_cases++;
+ }
+}
+console.log(`x87 tag masks: ${tag_cases} pop/push/exchange parity cases over TOP 0..7 passed`);
