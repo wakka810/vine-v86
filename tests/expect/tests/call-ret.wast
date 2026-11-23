@@ -439,30 +439,7 @@
                           (then
                             (local.set $p0
                               (local.get $l13))
-                            (br $L2)))
-                        (if $I21
-                          (i32.and
-                            (i32.eq
-                              (i32.load8_u offset={normalised output}
-                                (local.get $l12))
-                              (i32.const 3))
-                            (i32.eq
-                              (i32.load16_u offset={normalised output}
-                                (local.get $l12))
-                              (i32.const 899)))
-                          (then
-                            (br_if $L2
-                              (i32.ne
-                                (local.tee $p0
-                                  (i32.load16_u
-                                    (i32.add
-                                      (local.get $l12)
-                                      (i32.shl
-                                        (i32.and
-                                          (local.get $l11)
-                                          (i32.const 4095))
-                                        (i32.const 1)))))
-                                (i32.const 65535)))))))))))
+                            (br $L2)))))))))
             (br $B0))
           (unreachable)))
       (i32.store

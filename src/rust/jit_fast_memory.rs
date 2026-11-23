@@ -314,7 +314,10 @@ fn scan(cpu: &CpuContext, block: &BasicBlock) -> Option<Run> {
     run.end = run.ops.last()?.1;
     Some(run)
 }
-fn guarded_base(ctx: &mut JitContext, p: &Run, fail: Label) -> WasmLocal {
+// Returns the wasm-memory operand base plus the extra memarg offset every
+// access must add: under the memarg fold the local holds the guest address and
+// the arena base rides in the memarg.
+fn guarded_base(ctx: &mut JitContext, p: &Run, fail: Label) -> (WasmLocal, u32) {
     ctx.builder.const_i32(p.base.offset);
     for (r, coefficient) in p.base.coefficients.into_iter().enumerate() {
         if coefficient == 0 {
@@ -347,11 +350,14 @@ fn guarded_base(ctx: &mut JitContext, p: &Run, fail: Label) -> WasmLocal {
         ctx.builder.const_i32(mask);
         ctx.builder.ne_i32();
         ctx.builder.br_if(fail);
+        if codegen::common_memarg_base(ctx).is_some() {
+            return (address, base);
+        }
         ctx.builder.get_local(&address);
         ctx.builder.const_i32(base as i32);
         ctx.builder.add_i32();
         ctx.builder.set_local(&address);
-        return address;
+        return (address, 0);
     }
     ctx.builder.get_local(&address);
     ctx.builder.const_i32(12);
@@ -377,7 +383,7 @@ fn guarded_base(ctx: &mut JitContext, p: &Run, fail: Label) -> WasmLocal {
     ctx.builder.xor_i32();
     ctx.builder.set_local(&address);
     ctx.builder.free_local(entry);
-    address
+    (address, 0)
 }
 pub fn generate(ctx: &mut JitContext, block: &BasicBlock) -> bool {
     if cfg!(feature = "profiler") {
@@ -395,7 +401,7 @@ pub fn generate(ctx: &mut JitContext, block: &BasicBlock) -> bool {
     let saved_guarded = ctx.in_guarded_mem_run;
     let done = ctx.builder.block_void();
     let fail = ctx.builder.block_void();
-    let base = guarded_base(ctx, &p, fail);
+    let (base, base_extra) = guarded_base(ctx, &p, fail);
     ctx.block_stop_addr = p.end;
     ctx.in_guarded_mem_run = true;
     ctx.previous_instruction = Instruction::Other;
@@ -407,8 +413,9 @@ pub fn generate(ctx: &mut JitContext, block: &BasicBlock) -> bool {
         match op {
             Op::Load(r, a) => {
                 ctx.builder.get_local(&base);
-                ctx.builder
-                    .load_unaligned_i32((a.offset as i64 - p.base.offset as i64) as u32);
+                ctx.builder.load_unaligned_i32(
+                    (a.offset as i64 - p.base.offset as i64) as u32 + base_extra,
+                );
                 codegen::gen_set_reg32(ctx, r);
                 ctx.current_instruction = Instruction::Preserve {
                     clobbered_reg: Some(r),
@@ -417,8 +424,9 @@ pub fn generate(ctx: &mut JitContext, block: &BasicBlock) -> bool {
             Op::Store(r, a) => {
                 ctx.builder.get_local(&base);
                 codegen::gen_get_reg32(ctx, r);
-                ctx.builder
-                    .store_unaligned_i32((a.offset as i64 - p.base.offset as i64) as u32);
+                ctx.builder.store_unaligned_i32(
+                    (a.offset as i64 - p.base.offset as i64) as u32 + base_extra,
+                );
                 ctx.current_instruction = Instruction::Preserve {
                     clobbered_reg: None,
                 };
@@ -426,8 +434,9 @@ pub fn generate(ctx: &mut JitContext, block: &BasicBlock) -> bool {
             Op::StoreImm(value, a) => {
                 ctx.builder.get_local(&base);
                 ctx.builder.const_i32(value);
-                ctx.builder
-                    .store_unaligned_i32((a.offset as i64 - p.base.offset as i64) as u32);
+                ctx.builder.store_unaligned_i32(
+                    (a.offset as i64 - p.base.offset as i64) as u32 + base_extra,
+                );
                 ctx.current_instruction = Instruction::Preserve {
                     clobbered_reg: None,
                 };
@@ -435,7 +444,7 @@ pub fn generate(ctx: &mut JitContext, block: &BasicBlock) -> bool {
             Op::Load8(r, a) => {
                 ctx.builder.get_local(&base);
                 ctx.builder
-                    .load_u8((a.offset as i64 - p.base.offset as i64) as u32);
+                    .load_u8((a.offset as i64 - p.base.offset as i64) as u32 + base_extra);
                 codegen::gen_set_reg8_unmasked(ctx, r);
                 ctx.current_instruction = Instruction::Preserve {
                     clobbered_reg: Some(r & 3),
@@ -445,7 +454,7 @@ pub fn generate(ctx: &mut JitContext, block: &BasicBlock) -> bool {
                 ctx.builder.get_local(&base);
                 codegen::gen_get_reg8(ctx, r);
                 ctx.builder
-                    .store_u8((a.offset as i64 - p.base.offset as i64) as u32);
+                    .store_u8((a.offset as i64 - p.base.offset as i64) as u32 + base_extra);
                 ctx.current_instruction = Instruction::Preserve {
                     clobbered_reg: None,
                 };
@@ -453,7 +462,7 @@ pub fn generate(ctx: &mut JitContext, block: &BasicBlock) -> bool {
             Op::LoadZx8(r, a) => {
                 ctx.builder.get_local(&base);
                 ctx.builder
-                    .load_u8((a.offset as i64 - p.base.offset as i64) as u32);
+                    .load_u8((a.offset as i64 - p.base.offset as i64) as u32 + base_extra);
                 codegen::gen_set_reg32(ctx, r);
                 ctx.current_instruction = Instruction::Preserve {
                     clobbered_reg: Some(r),
@@ -461,8 +470,9 @@ pub fn generate(ctx: &mut JitContext, block: &BasicBlock) -> bool {
             },
             Op::LoadZx16(r, a) => {
                 ctx.builder.get_local(&base);
-                ctx.builder
-                    .load_unaligned_u16((a.offset as i64 - p.base.offset as i64) as u32);
+                ctx.builder.load_unaligned_u16(
+                    (a.offset as i64 - p.base.offset as i64) as u32 + base_extra,
+                );
                 codegen::gen_set_reg32(ctx, r);
                 ctx.current_instruction = Instruction::Preserve {
                     clobbered_reg: Some(r),
@@ -471,8 +481,9 @@ pub fn generate(ctx: &mut JitContext, block: &BasicBlock) -> bool {
             Op::PushReg(r, a) => {
                 ctx.builder.get_local(&base);
                 codegen::gen_get_reg32(ctx, r);
-                ctx.builder
-                    .store_unaligned_i32((a.offset as i64 - p.base.offset as i64) as u32);
+                ctx.builder.store_unaligned_i32(
+                    (a.offset as i64 - p.base.offset as i64) as u32 + base_extra,
+                );
                 codegen::gen_get_reg32(ctx, regs::ESP);
                 ctx.builder.const_i32(4);
                 ctx.builder.sub_i32();
@@ -484,8 +495,9 @@ pub fn generate(ctx: &mut JitContext, block: &BasicBlock) -> bool {
             Op::PushImm(value, a) => {
                 ctx.builder.get_local(&base);
                 ctx.builder.const_i32(value);
-                ctx.builder
-                    .store_unaligned_i32((a.offset as i64 - p.base.offset as i64) as u32);
+                ctx.builder.store_unaligned_i32(
+                    (a.offset as i64 - p.base.offset as i64) as u32 + base_extra,
+                );
                 codegen::gen_get_reg32(ctx, regs::ESP);
                 ctx.builder.const_i32(4);
                 ctx.builder.sub_i32();
@@ -496,8 +508,9 @@ pub fn generate(ctx: &mut JitContext, block: &BasicBlock) -> bool {
             },
             Op::PopReg(r, a) => {
                 ctx.builder.get_local(&base);
-                ctx.builder
-                    .load_unaligned_i32((a.offset as i64 - p.base.offset as i64) as u32);
+                ctx.builder.load_unaligned_i32(
+                    (a.offset as i64 - p.base.offset as i64) as u32 + base_extra,
+                );
                 codegen::gen_set_reg32(ctx, r);
                 codegen::gen_get_reg32(ctx, regs::ESP);
                 ctx.builder.const_i32(4);

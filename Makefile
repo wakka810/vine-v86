@@ -367,6 +367,12 @@ rust-test-intensive:
 vine-jit-budget-test: build/v86-fallback.wasm
 	node tests/api/vine-jit-budget.js
 
+vine-jit-boundary-test: build/v86-fallback.wasm
+	node tests/api/vine-jit-boundary.js
+
+vine-jit-page-tail-test: build/v86-fallback.wasm
+	node tests/api/vine-jit-page-tail.js
+
 vine-jit-chaining-test: build/v86-fallback.wasm
 	node tests/api/vine-jit-chaining.js
 
@@ -375,6 +381,9 @@ vine-jit-leaf-copy-test: build/v86-fallback.wasm
 
 vine-jit-affine-ram-test: build/v86-fallback.wasm
 	node tests/api/vine-jit-affine-ram.js
+
+vine-jit-guard-exit-test: build/v86-fallback.wasm
+	node tests/api/vine-jit-guard-exit.js
 
 vine-x87-performance-test: build/v86-fallback.wasm
 	node tests/api/vine-x87-performance.js

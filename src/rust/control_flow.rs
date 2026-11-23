@@ -58,7 +58,7 @@ pub fn make_graph(basic_blocks: &Vec<BasicBlock>) -> Graph {
                 ..
             } => {},
             BasicBlockType::Exit => {},
-            BasicBlockType::AbsoluteEip => {
+            BasicBlockType::AbsoluteEip | BasicBlockType::BoundaryStep { .. } => {
                 // Not necessary: We generate a loop around the outer brtable unconditionally
                 //edges.insert(ENTRY_NODE_ID);
             },

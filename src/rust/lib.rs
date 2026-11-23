@@ -14,6 +14,7 @@ mod codegen;
 mod config;
 mod control_flow;
 mod cpu_context;
+mod fast_hash;
 mod fast_x87;
 mod gen;
 mod jit;

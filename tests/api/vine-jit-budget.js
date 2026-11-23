@@ -152,6 +152,10 @@ export function create_cpu(code, {
     wasm.set_jit_config(4, Number(exact));
     wasm.set_jit_config(5, 1);
     wasm.set_jit_config(6, Number(!asynchronous));
+    if(process.env.V86_TEST_CG !== undefined)
+        wasm.set_jit_config(18, Number(process.env.V86_TEST_CG));
+    if(typeof wasm.get_jit_config === "function" && wasm.get_jit_config(14) !== undefined)
+        wasm.set_jit_config(14, Number(process.env.V86_TEST_GUARD_EXIT === "1"));
     new Uint8Array(wasm.memory.buffer, physical_base + START, code.length).set(code);
 
     wasm.vine_cpu_state_save();
@@ -568,6 +572,60 @@ for(const [name, ending, reason] of [["halt", [0xF4], 2], ["invalid-opcode", [0x
     }
     jit.assert_hoisted();
     console.log(`tiny ${name}: exact terminal state and previous IP passed`);
+}
+
+// A call into the configured host-call range stops with reason 4, EIP at the
+// endpoint and exactly one extra retired instruction - the same words the
+// endpoint's UD2 produces, without interpreting it. With the range unset the
+// same program stops with 0x106 and the identical counter and EIP.
+{
+    const endpoint = START + 7;
+    // inc eax; inc eax; call $+5 -> endpoint; [endpoint] ud2; ud2
+    const code = [0x40, 0x40, 0xE8, 0, 0, 0, 0, 0x0F, 0x0B, 0x0F, 0x0B];
+    const { jit, cpus, execute } = create_pair(code);
+    for(const cpu of cpus)
+    {
+        assert.equal(cpu.wasm.vine_set_host_call_range(endpoint, 0x10, 0x10), 0);
+    }
+    const ranged = execute(64, "host-call range stop");
+    assert.equal(ranged.reason, 4, "host-call range reports runtime dispatch");
+    assert.equal(ranged.instructions, 4,
+        "two inc, the jmp, and one endpoint instruction");
+    {
+        const state = jit.full_snapshot().state;
+        assert.equal(state[10], endpoint, "ranged stop EIP at endpoint");
+        assert.equal(state[11], endpoint, "ranged stop previous IP at endpoint");
+    }
+
+    const { jit: unbound, execute: execute_unbound } = create_pair(code);
+    const unranged = execute_unbound(64, "host-call range unset");
+    assert.equal(unranged.reason, 0x106, "unset range falls back to the UD2 stop");
+    assert.equal(unranged.instructions, ranged.instructions,
+        "identical retired instruction count");
+    {
+        const state = unbound.full_snapshot().state;
+        assert.equal(state[10], endpoint, "UD2 stop EIP at endpoint");
+        assert.equal(state[11], endpoint, "UD2 stop previous IP at endpoint");
+    }
+    console.log("host-call range: reason 4 with UD2-identical EIP and counter passed");
+}
+
+// Branch to an ordinary instruction inside a slot. Compare its execution
+// and subsequent UD2 with an unconfigured CPU.
+{
+    const endpoint = START + 5;
+    const code = [0xE9, 2, 0, 0, 0, 0x0F, 0x0B, 0x40, 0x0F, 0x0B];
+    const ranged = create_pair(code);
+    const plain = create_pair(code);
+    for(const cpu of ranged.cpus)
+    {
+        assert.equal(cpu.wasm.vine_set_host_call_range(endpoint, 16, 16), 0);
+        assert.equal(cpu.wasm.vine_set_host_call_range(endpoint, 16, 0), 1);
+    }
+    const expected = plain.execute(64, "ordinary instruction inside a slot");
+    assert.equal(expected.reason, 0x106);
+    assert.deepEqual(ranged.execute(64, "padding inside host-call range"), expected);
+    assert.deepEqual(ranged.jit.full_snapshot(), plain.jit.full_snapshot());
 }
 
 // After warming, execute the byte store from the compiled module it modifies.

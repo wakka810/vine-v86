@@ -80,18 +80,45 @@ pub unsafe fn vine_set_jit_chaining(enabled: u32) -> u32 {
     0
 }
 
-// Maximum number of pages per wasm module. Necessary for the following reasons:
-// - There is an upper limit on the size of a single function in wasm (currently ~7MB in all browsers)
-//   See https://github.com/WebAssembly/design/issues/1138
-// - v8 poorly handles large br_table elements and OOMs on modules much smaller than the above limit
-//   See https://bugs.chromium.org/p/v8/issues/detail?id=9697 and https://bugs.chromium.org/p/v8/issues/detail?id=9141
-//   Will hopefully be fixed in the near future by generating direct control flow
-static mut MAX_PAGES: u32 = 3;
+// Maximum number of primary pages per wasm module (copied leaf pages do not
+// count; set_jit_config 1). 0 means automatic: one page under Vine execution
+// -- cross-page transfers take the fused chain path, and keeping the budget
+// on one hot page avoids cold-page recompiles -- and three elsewhere. The
+// bound still exists because wasm caps single-function size and v8 OOMs on
+// large br_table elements
+// (https://bugs.chromium.org/p/v8/issues/detail?id=9697).
+static mut MAX_PAGES: u32 = 0;
+
+// The configured primary-page limit, resolving the automatic value.
+fn effective_max_pages() -> u32 {
+    match unsafe { MAX_PAGES } {
+        0 => {
+            if unsafe { cpu::vine_execution_is_active() } {
+                1
+            }
+            else {
+                3
+            }
+        },
+        configured => configured,
+    }
+}
 // Measured on a call-heavy interpreter workload: with 4, hot tiny callees on
 // other pages lost the budget to cold ones and every such call/ret became a
 // cross-module transfer; 64 gave nothing over 16.
 static mut MAX_COPIED_LEAF_PAGES: u32 = 16;
 
+// Boundary steps (set_jit_config 17, on/off): an instruction that ends at or
+// crosses a page boundary may end a block with a step through
+// vine_jit_boundary_step instead of pushing the whole block back to the
+// interpreter. Applies to modules compiled after it is set; Vine execution
+// only (see boundary_step_enabled).
+static mut BOUNDARY_STEPS: bool = true;
+// Code-generation A/B options (set_jit_config(18), applies to modules
+// compiled after it is set). Bit 0: chain directly with the loaded
+// state/target index in the indirect-jump tail. Bit 1: common-memory
+// accesses use the wasm memarg offset for the arena base.
+pub static mut JIT_CG_OPTIONS: u32 = 3;
 static mut JIT_USE_LOOP_SAFETY: bool = true;
 
 pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
@@ -99,6 +126,23 @@ pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
 pub static mut JIT_X87_TYPED_RUNS: bool = true;
 pub static mut JIT_X87_MAX_OPS: u32 = 64;
 pub static mut JIT_X87_MAX_ADDRESSES: u32 = 24;
+
+/// Guard exits (set_jit_config 14, bit mask): bit 0 = a failed common-memory
+/// guard in generated code exits the module and the main loop interprets the
+/// instruction, instead of calling the rejoining slow helper. Like the other
+/// code-generation knobs it applies to modules compiled while it is set;
+/// modules generated with it off are byte-identical.
+pub static mut JIT_GUARD_EXIT: u32 = 3;
+
+/// Guard-exit deopt limit (set_jit_config 16): when the guards of generated
+/// code on one page have bailed this often, the page's generated code is
+/// invalidated and its next compile uses the rejoining slow-helper shape.
+pub static mut JIT_GUARD_BAIL_LIMIT: u32 = 64;
+
+/// Codegen counters for the guard-exit path: guards emitted with the
+/// bail arm versus guards that kept the rejoining slow helper.
+pub static mut GUARD_EXIT_SITES: u32 = 0;
+pub static mut GUARD_KEPT_SITES: u32 = 0;
 
 pub static mut JIT_THRESHOLD: u32 = 200 * 1000;
 
@@ -156,17 +200,63 @@ enum CompilingPageState {
     CompilingWritten,
 }
 
+/// 4096-bit per-page bitmap of registered instruction-start offsets.
+/// Iterates set bits in ascending order, making block discovery order
+/// independent of the hasher.
+struct EntryPointSet {
+    bits: Box<[u64; 64]>,
+    len: u32,
+}
+
+impl EntryPointSet {
+    fn new() -> Self {
+        Self {
+            bits: Box::new([0; 64]),
+            len: 0,
+        }
+    }
+    fn insert(&mut self, offset: u16) -> bool {
+        let bit = offset & 0xFFF;
+        let word = &mut self.bits[(bit / 64) as usize];
+        let mask = 1u64 << (bit % 64);
+        let was_present = *word & mask != 0;
+        *word |= mask;
+        self.len += !was_present as u32;
+        !was_present
+    }
+    #[allow(dead_code)]
+    fn contains(&self, offset: u16) -> bool {
+        let bit = offset & 0xFFF;
+        self.bits[(bit / 64) as usize] & (1u64 << (bit % 64)) != 0
+    }
+    #[allow(dead_code)]
+    fn is_empty(&self) -> bool { self.len == 0 }
+    #[allow(dead_code)]
+    fn len(&self) -> u32 { self.len }
+    fn iter(&self) -> impl Iterator<Item = u16> + '_ {
+        self.bits
+            .iter()
+            .enumerate()
+            .flat_map(|(word_index, &word)| {
+                (0..64).filter_map(move |b| {
+                    (word >> b & 1 == 1).then_some((word_index * 64 + b) as u16)
+                })
+            })
+    }
+}
+
 struct JitState {
     wasm_builder: WasmBuilder,
 
-    // as an alternative to HashSet, we could use a bitmap of 4096 bits here
-    // (faster, but uses much more memory)
-    // or a compressed bitmap (likely faster)
-    // or HashSet<u32> rather than nested
-    entry_points: HashMap<Page, (u32, HashSet<u16>)>,
+    entry_points: crate::fast_hash::FastHashMap<Page, (u32, EntryPointSet)>,
     pages: HashMap<Page, PageInfo>,
     wasm_table_index_free_list: Vec<WasmTableIndex>,
     compiling: Option<(WasmTableIndex, CompilingPageState)>,
+    // Guard bails per page of the bailing instruction and the pages whose
+    // generated code must use the rejoining slow-helper shape; both live
+    // until the full JIT clear.
+    guard_bail_counts: HashMap<Page, u32>,
+    guard_exit_disabled: HashSet<Page>,
     #[cfg(debug_assertions)]
     wasm_table_index_to_page: HashMap<WasmTableIndex, HashSet<Page>>,
 }
@@ -249,11 +339,13 @@ impl JitState {
         JitState {
             wasm_builder: WasmBuilder::new(),
 
-            entry_points: HashMap::new(),
+            entry_points: crate::fast_hash::FastHashMap::default(),
             pages: HashMap::new(),
 
             wasm_table_index_free_list: Vec::from_iter(wasm_table_indices),
             compiling: None,
+            guard_bail_counts: HashMap::new(),
+            guard_exit_disabled: HashSet::new(),
 
             #[cfg(debug_assertions)]
             wasm_table_index_to_page: HashMap::new(),
@@ -277,6 +369,15 @@ pub enum BasicBlockType {
     },
     // Set eip to an absolute value (ret, jmp r/m, call r/m)
     AbsoluteEip,
+    // the block's last instruction starts at `step_addr` on this page
+    /// and cannot be compiled (it ends at or crosses the page boundary);
+    /// generated code publishes eip = step_addr, steps it through
+    /// `vine_jit_boundary_step` and continues with the indirect-jump tail.
+    /// A block whose first instruction is a boundary instruction consists of
+    /// only the step (number_of_instructions == 0).
+    BoundaryStep {
+        step_addr: u32,
+    },
     Exit,
 }
 
@@ -435,6 +536,23 @@ pub struct JitContext<'a> {
     // they could not be decoded exactly. jit_instruction resolves the current
     // instruction's index from this to fill fault_precharge.
     pub fault_instr_starts: Option<Vec<u32>>,
+    // Guard-exit tracking for the instruction currently generated by
+    // jit_instruction: set when its emission has already changed
+    // architectural state other than a guest-memory access (a register local
+    // or the vector cache). A failed guard may only exit to the interpreter
+    // while the whole instruction can still be re-executed exactly.
+    pub instr_state_dirty: bool,
+    // builder.imported_call_count() at the start of the current instruction's
+    // codegen. Any imported call since makes a guard bail unsafe: helpers
+    // update architectural state or perform observable IO.
+    pub instr_calls_base: usize,
+    // The block being generated lives on a copied or inlined leaf page whose
+    // guest bytes may be rewritten before the code runs: a guard exit there
+    // would interpret different instructions than the ones generated.
+    pub copied_leaf_page: bool,
+    // Pages whose guard bails hit the deopt limit: their instructions keep
+    // the rejoining slow-helper shape.
+    pub guard_exit_disabled: &'a HashSet<Page>,
     pub instruction_counter: WasmLocal,
     pub instruction_limit: Option<WasmLocal>,
     pub wasm_table_index: WasmTableIndex,
@@ -470,6 +588,72 @@ pub const JIT_INSTR_BLOCK_BOUNDARY_FLAG: u32 = 1 << 0;
 
 pub fn is_near_end_of_page(address: u32) -> bool {
     address & 0xFFF >= 0x1000 - MAX_INSTRUCTION_LENGTH
+}
+
+enum InstructionFit {
+    /// The instruction ends strictly inside its page and may be compiled.
+    Inside,
+    /// The instruction's last byte is the last byte of its page or it straddles
+    /// the page boundary: it cannot be compiled, but it can be stepped through
+    /// `vine_jit_boundary_step` as a block-final instruction.
+    Boundary,
+    /// The decode needed to classify the instruction would read past the
+    /// physical reservation: keep it interpreted by the main loop.
+    Reject,
+}
+
+fn instruction_fit(phys_addr: u32, cpu: &CpuContext) -> InstructionFit {
+    if phys_addr & 0xFFF < 0x1000 - MAX_INSTRUCTION_LENGTH {
+        // the fast case: any instruction fits
+        return InstructionFit::Inside;
+    }
+    // The scratch decode below may read up to MAX_INSTRUCTION_LENGTH bytes starting at
+    // `phys_addr`; past the physical reservation memory::read8 would take the MMIO host path.
+    if phys_addr as u64 + u64::from(MAX_INSTRUCTION_LENGTH)
+        > unsafe { *global_pointers::memory_size } as u64
+    {
+        return InstructionFit::Reject;
+    }
+    // Decode the instruction exactly as the block analysis does on a scratch context and check
+    // whether the address after it is still in the same page. Note the CpuContext::read_imm*
+    // dbg_asserts require slack before the page end, so under debug_assertions this decode may
+    // only be run on instructions whose immediates stay inside the page — release builds, where
+    // the asserts compile out, decode boundary-crossing instructions here freely.
+    let mut scratch = CpuContext {
+        eip: phys_addr,
+        ..cpu.clone()
+    };
+    analysis::analyze_step(&mut scratch);
+    if Page::page_of(scratch.eip) == Page::page_of(phys_addr) {
+        InstructionFit::Inside
+    }
+    else {
+        InstructionFit::Boundary
+    }
+}
+
+/// True when the instruction starting at `phys_addr` may be compiled into its page's module: it
+/// ends strictly inside the page (its last byte is at page offset <= 0xFFE, so the address after
+/// it is still in the same page).
+fn instruction_fits_in_page(phys_addr: u32, cpu: &CpuContext) -> bool {
+    matches!(instruction_fit(phys_addr, cpu), InstructionFit::Inside)
+}
+
+/// Whether blocks on `page` may end with a boundary-step terminator
+/// (set_jit_config 17). Vine execution only: the step does not model
+/// `jit_block_boundary`/IRQ handling, so full-system code keeps the
+/// interpreter fallback. Also kept disabled for 16-bit code and inside
+/// copied leaf pages.
+fn boundary_step_enabled(cpu: &CpuContext, page: Page, copied_pages: &HashSet<Page>) -> bool {
+    // Exact-budget mode only: the terminator republishes the counter local at
+    // zero and folds the consumed budget into the limit local. Without an
+    // invocation limit that zeroing would defeat the loop-safety counter in
+    // the same way, so the non-exact path keeps the old behaviour.
+    (unsafe { cpu::vine_execution_is_active() })
+        && cpu.state_flags.is_32()
+        && unsafe { cpu::vine_jit_exact_instruction_budget }
+        && unsafe { BOUNDARY_STEPS }
+        && !copied_pages.contains(&page)
 }
 
 pub fn jit_find_cache_entry(phys_address: u32, state_flags: CachedStateFlags) -> CachedCode {
@@ -630,9 +814,6 @@ fn jit_find_basic_blocks(
         copied_pages: &mut HashSet<Page>,
         cpu: &CpuContext,
     ) -> Option<u32> {
-        if is_near_end_of_page(virt_target as u32) {
-            return None;
-        }
         let phys_target = match cpu::translate_address_read_no_side_effects(virt_target) {
             Err(()) => {
                 dbg_log!("Not analysing {:x} (page not mapped)", virt_target);
@@ -640,6 +821,13 @@ fn jit_find_basic_blocks(
             },
             Ok(t) => t,
         };
+
+        match instruction_fit(phys_target, cpu) {
+            InstructionFit::Inside => {},
+            InstructionFit::Boundary
+                if boundary_step_enabled(cpu, Page::page_of(phys_target), copied_pages) => {},
+            _ => return None,
+        }
 
         let phys_page = Page::page_of(phys_target);
 
@@ -685,13 +873,13 @@ fn jit_find_basic_blocks(
                 if !target_only
                     && entry_points
                         .iter()
-                        .all(|entry| required_entries.contains(entry))
+                        .all(|entry| required_entries.contains(&entry))
                 {
                     page_blacklist.insert(phys_page);
                     return None;
                 }
                 *hotness = 0;
-                required_entries.extend(entry_points.iter().copied());
+                required_entries.extend(entry_points.iter());
             }
             else if !target_only {
                 page_blacklist.insert(phys_page);
@@ -721,8 +909,11 @@ fn jit_find_basic_blocks(
     let mut inlined_leaf_pages: HashSet<Page> = HashSet::new();
 
     // 16-bit doesn't work correctly, most likely due to instruction pointer wrap-around
-    let max_pages = if cpu.state_flags.is_32() { unsafe { MAX_PAGES } } else { 1 };
-    let max_copied_leaf_pages = if max_pages > 1 { unsafe { MAX_COPIED_LEAF_PAGES } } else { 0 };
+    let max_pages = if cpu.state_flags.is_32() { effective_max_pages() } else { 1 };
+    // Copied/inlined leaf pages are a 32-bit feature independent of the
+    // primary page limit: a one-page module may still fold leaf callees.
+    let max_copied_leaf_pages =
+        if cpu.state_flags.is_32() { unsafe { MAX_COPIED_LEAF_PAGES } } else { 0 };
 
     for virt_addr in entry_points {
         let ok = follow_jump(
@@ -755,10 +946,38 @@ fn jit_find_basic_blocks(
             continue;
         }
 
-        if is_near_end_of_page(phys_addr) {
-            // Empty basic block, don't insert
-            profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
-            continue;
+        match instruction_fit(phys_addr, &cpu) {
+            InstructionFit::Inside => {},
+            InstructionFit::Boundary
+                if boundary_step_enabled(&cpu, Page::page_of(phys_addr), &copied_pages) =>
+            {
+                // Block consisting only of the boundary step; a valid entry
+                // point so jumps/entries to this address stay in generated
+                // code. end_addr = addr + 1 keeps the non-empty invariant; the
+                // step publishes step_addr, not end_addr.
+                basic_blocks.insert(
+                    phys_addr,
+                    BasicBlock {
+                        addr: phys_addr,
+                        virt_addr: to_visit,
+                        last_instruction_addr: phys_addr,
+                        end_addr: phys_addr + 1,
+                        ty: BasicBlockType::BoundaryStep {
+                            step_addr: phys_addr,
+                        },
+                        is_entry_block: true,
+                        has_sti: false,
+                        number_of_instructions: 0,
+                        inlined_call: None,
+                    },
+                );
+                continue;
+            },
+            _ => {
+                // Empty basic block, don't insert
+                profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
+                continue;
+            },
         }
 
         let mut current_address = phys_addr;
@@ -824,7 +1043,7 @@ fn jit_find_basic_blocks(
                         // handle_irqs may be called)
 
                         if basic_blocks.contains_key(&current_address) {
-                            dbg_assert!(!is_near_end_of_page(current_address));
+                            dbg_assert!(instruction_fits_in_page(current_address, cpu));
                             current_block.ty = BasicBlockType::Normal {
                                 next_block_addr: Some(current_address),
                                 jump_offset: 0,
@@ -859,11 +1078,20 @@ fn jit_find_basic_blocks(
                     dbg_assert!(has_next_instruction);
                     to_visit_stack.push(current_virt_addr);
 
-                    let next_block_addr = if is_near_end_of_page(current_address) {
-                        None
-                    }
-                    else {
-                        Some(current_address)
+                    let next_block_addr = match instruction_fit(current_address, cpu) {
+                        InstructionFit::Inside => Some(current_address),
+                        InstructionFit::Boundary
+                            if boundary_step_enabled(
+                                cpu,
+                                Page::page_of(current_address),
+                                &copied_pages,
+                            ) =>
+                        {
+                            marked_as_entry.insert(current_virt_addr);
+                            to_visit_stack.push(current_virt_addr);
+                            Some(current_address)
+                        },
+                        _ => None,
                     };
 
                     current_block.ty = BasicBlockType::ConditionalJump {
@@ -994,9 +1222,25 @@ fn jit_find_basic_blocks(
                 },
             }
 
-            if is_near_end_of_page(current_address) {
-                profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
-                break;
+            match instruction_fit(current_address, cpu) {
+                InstructionFit::Inside => {},
+                InstructionFit::Boundary
+                    if boundary_step_enabled(
+                        cpu,
+                        Page::page_of(current_address),
+                        &copied_pages,
+                    ) =>
+                {
+                    profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
+                    current_block.ty = BasicBlockType::BoundaryStep {
+                        step_addr: current_address,
+                    };
+                    break;
+                },
+                _ => {
+                    profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
+                    break;
+                },
             }
         }
 
@@ -1071,7 +1315,9 @@ fn jit_find_basic_blocks(
                     *next_block_branch_taken_addr = None;
                 }
             },
-            BasicBlockType::Exit | BasicBlockType::AbsoluteEip => {},
+            BasicBlockType::Exit
+            | BasicBlockType::AbsoluteEip
+            | BasicBlockType::BoundaryStep { .. } => {},
         }
     }
 
@@ -1102,15 +1348,26 @@ fn jit_find_basic_blocks(
 #[no_mangle]
 #[cfg(debug_assertions)]
 pub fn jit_force_generate_unsafe(virt_addr: i32) {
+    let phys_addr = cpu::translate_address_read(virt_addr).unwrap();
+    let cs_offset = cpu::get_seg_cs() as u32;
+    let state_flags = cpu::get_state_flags();
     dbg_assert!(
-        !is_near_end_of_page(virt_addr as u32),
-        "cannot force compile near end of page"
+        instruction_fits_in_page(
+            phys_addr,
+            &CpuContext {
+                eip: phys_addr,
+                prefixes: 0,
+                cs_offset,
+                state_flags
+            }
+        ),
+        "cannot force compile an instruction that crosses its page end"
     );
     jit_increase_hotness_and_maybe_compile(
         virt_addr,
-        cpu::translate_address_read(virt_addr).unwrap(),
-        cpu::get_seg_cs() as u32,
-        cpu::get_state_flags(),
+        phys_addr,
+        cs_offset,
+        state_flags,
         unsafe { JIT_THRESHOLD },
         true,
     );
@@ -1141,7 +1398,7 @@ fn jit_analyze_and_generate(
 
     if entry_points
         .iter()
-        .all(|entry_point| existing_entry_points.contains(entry_point))
+        .all(|entry_point| existing_entry_points.contains(&entry_point))
     {
         profiler::stat_increment(stat::COMPILE_SKIPPED_NO_NEW_ENTRY_POINTS);
         return;
@@ -1173,7 +1430,7 @@ fn jit_analyze_and_generate(
     let virt_page = Page::page_of(virt_entry_point as u32);
     let entry_points: HashSet<i32> = entry_points
         .iter()
-        .map(|e| virt_page.to_address() as i32 | *e as i32)
+        .map(|e| virt_page.to_address() as i32 | e as i32)
         .collect();
     let (basic_blocks, mut copied_pages, inlined_leaf_pages) =
         jit_find_basic_blocks(ctx, entry_points, cpu.clone());
@@ -1239,7 +1496,7 @@ fn jit_analyze_and_generate(
                     ..
                 } => format!(""),
                 BasicBlockType::Exit => format!(""),
-                BasicBlockType::AbsoluteEip => format!(""),
+                BasicBlockType::AbsoluteEip | BasicBlockType::BoundaryStep { .. } => format!(""),
             }
         );
     }
@@ -1300,13 +1557,8 @@ fn jit_analyze_and_generate(
     dbg_assert!(!pages.is_empty());
     dbg_assert!(
         pages.len()
-            <= unsafe { MAX_PAGES } as usize
-                + if unsafe { MAX_PAGES } > 1 {
-                    (unsafe { MAX_COPIED_LEAF_PAGES }) as usize
-                }
-                else {
-                    0
-                }
+            <= (if state_flags.is_32() { effective_max_pages() } else { 1 }) as usize
+                + if state_flags.is_32() { (unsafe { MAX_COPIED_LEAF_PAGES }) as usize } else { 0 }
     );
 
     let basic_block_by_addr: HashMap<u32, BasicBlock> =
@@ -1315,6 +1567,8 @@ fn jit_analyze_and_generate(
     let entries = jit_generate_module(
         structure,
         &basic_block_by_addr,
+        &copied_pages,
+        &ctx.guard_exit_disabled,
         cpu,
         &mut ctx.wasm_builder,
         wasm_table_index,
@@ -1332,7 +1586,7 @@ fn jit_analyze_and_generate(
         });
         ctx.entry_points
             .entry(p)
-            .or_insert_with(|| (0, HashSet::new()));
+            .or_insert_with(|| (0, EntryPointSet::new()));
     }
     for &(addr, state) in &entries {
         let code = page_info.get_mut(&Page::page_of(addr)).unwrap();
@@ -1530,9 +1784,11 @@ pub fn set_tlb_code(
     }
 }
 
-fn jit_generate_module(
+fn jit_generate_module<'a>(
     structure: Vec<WasmStructure>,
     basic_blocks: &HashMap<u32, BasicBlock>,
+    copied_pages: &'a HashSet<Page>,
+    guard_exit_disabled: &'a HashSet<Page>,
     mut cpu: CpuContext,
     builder: &mut WasmBuilder,
     wasm_table_index: WasmTableIndex,
@@ -1684,6 +1940,10 @@ fn jit_generate_module(
         in_guarded_mem_run: false,
         fault_precharge: None,
         fault_instr_starts: None,
+        instr_state_dirty: false,
+        instr_calls_base: 0,
+        copied_leaf_page: false,
+        guard_exit_disabled,
         instruction_counter,
         instruction_limit,
         wasm_table_index,
@@ -1857,6 +2117,7 @@ fn jit_generate_module(
                     ),
                     _ => (None, None),
                 };
+                ctx.copied_leaf_page = copied_pages.contains(&Page::page_of(addr));
                 jit_generate_basic_block(ctx, block, fallthrough_loop, skip_loop, state_flags);
 
                 if block.has_sti {
@@ -1902,7 +2163,7 @@ fn jit_generate_module(
                             }
                         },
                         BasicBlockType::Exit => {},
-                        BasicBlockType::AbsoluteEip => {},
+                        BasicBlockType::AbsoluteEip | BasicBlockType::BoundaryStep { .. } => {},
                     };
                     codegen::gen_debug_track_jit_exit(ctx.builder, block.last_instruction_addr);
                     codegen::gen_move_registers_from_locals_to_memory(ctx);
@@ -2002,142 +2263,68 @@ fn jit_generate_module(
                             }
                         }
                         // Check if we can stay in this module, if not exit
-                        // Single fused tlb_code lookup for both intra-module dispatch and cross-module chaining.
                         ctx.builder.free_local(virt_address);
-                        codegen::gen_profiler_stat_increment(ctx.builder, stat::INDIRECT_JUMP);
-                        codegen::gen_get_eip(ctx.builder);
-                        let virt_address = ctx.builder.tee_new_local();
-                        ctx.builder.get_local(&virt_address);
-                        ctx.builder.const_i32(12);
-                        ctx.builder.shr_u_i32();
-                        ctx.builder.const_i32(2);
-                        ctx.builder.shl_i32();
-                        ctx.builder.load_aligned_i32(unsafe {
-                            &cpu::tlb_code[0] as *const Option<NonNull<cpu::Code>> as u32
-                        });
-                        let code = ctx.builder.tee_new_local();
-                        ctx.builder.if_void();
-                        {
-                            ctx.builder.get_local(&code);
-                            ctx.builder
-                                .load_u8(std::mem::offset_of!(cpu::Code, state_flags) as u32);
-                            ctx.builder.const_i32(state_flags.to_u32() as i32);
-                            ctx.builder.eq_i32();
+                        gen_indirect_jump_tail(
+                            ctx,
+                            state_flags,
+                            wasm_table_index,
+                            main_loop_label,
+                            target_block,
+                            block.last_instruction_addr,
+                        );
+                    },
+                    &BasicBlockType::BoundaryStep { step_addr } => {
+                        // run the page-boundary instruction through
+                        // the interpreter helper, then continue with the
+                        // indirect-jump tail.
+                        codegen::gen_set_eip_low_bits(ctx.builder, step_addr as i32 & 0xFFF);
+                        if let Some(limit) = &ctx.instruction_limit {
+                            ctx.builder.get_local(&ctx.instruction_counter);
+                            ctx.builder.const_i32(1);
+                            ctx.builder.add_i32();
+                            ctx.builder.get_local(limit);
+                            ctx.builder.gtu_i32();
                             ctx.builder.if_void();
-                            {
-                                ctx.builder.get_local(&code);
-                                ctx.builder.get_local(&virt_address);
-                                ctx.builder.const_i32(0xFFF);
-                                ctx.builder.and_i32();
-                                ctx.builder.const_i32(1);
-                                ctx.builder.shl_i32();
-                                ctx.builder.add_i32();
-                                ctx.builder.load_aligned_u16(std::mem::offset_of!(
-                                    cpu::Code,
-                                    state_table
-                                )
-                                    as u32);
-                                let state = ctx.builder.tee_new_local();
-                                ctx.builder.const_i32(u16::MAX as i32);
-                                ctx.builder.ne_i32();
-                                ctx.builder.if_void();
-                                {
-                                    ctx.builder.get_local(&code);
-                                    ctx.builder.load_aligned_u16(std::mem::offset_of!(
-                                        cpu::Code,
-                                        wasm_table_index
-                                    )
-                                        as u32);
-                                    let target_idx = ctx.builder.tee_new_local();
-                                    ctx.builder.const_i32(wasm_table_index.to_u16() as i32);
-                                    ctx.builder.eq_i32();
-                                    ctx.builder.if_void();
-                                    {
-                                        ctx.builder.get_local(&state);
-                                        ctx.builder.set_local(target_block);
-                                        ctx.builder.br(main_loop_label);
-                                    }
-                                    ctx.builder.block_end();
-
-                                    ctx.builder.get_local(&code);
-                                    ctx.builder.load_u8(
-                                        std::mem::offset_of!(cpu::Code, state_flags) as u32,
-                                    );
-                                    ctx.builder.const_i32(state_flags.to_u32() as i32);
-                                    ctx.builder.eq_i32();
-                                    ctx.builder.get_local(&code);
-                                    ctx.builder.load_aligned_u16(std::mem::offset_of!(
-                                        cpu::Code,
-                                        wasm_table_index
-                                    )
-                                        as u32);
-                                    ctx.builder.const_i32(wasm_table_index.to_u16() as i32);
-                                    ctx.builder.eq_i32();
-                                    ctx.builder.and_i32();
-                                    ctx.builder.if_void();
-
-                                    ctx.builder.get_local(&code);
-                                    ctx.builder.get_local(&virt_address);
-                                    ctx.builder.const_i32(0xFFF);
-                                    ctx.builder.and_i32();
-                                    ctx.builder.const_i32(1);
-                                    ctx.builder.shl_i32();
-                                    ctx.builder.add_i32();
-                                    ctx.builder.load_aligned_u16(std::mem::offset_of!(
-                                        cpu::Code,
-                                        state_table
-                                    )
-                                        as u32);
-                                    ctx.builder.tee_local(target_block);
-                                    ctx.builder.const_i32(u16::MAX as i32);
-                                    ctx.builder.ne_i32();
-                                    ctx.builder.br_if(main_loop_label);
-
-                                    if ctx.builder.is_chained() {
-                                        codegen::gen_profiler_stat_increment(
-                                            ctx.builder,
-                                            stat::INDIRECT_JUMP_NO_ENTRY,
-                                        );
-                                        codegen::gen_debug_track_jit_exit(
-                                            ctx.builder,
-                                            block.last_instruction_addr,
-                                        );
-                                        ctx.builder.get_local(&state);
-                                        for register in ctx.register_locals.iter() {
-                                            ctx.builder.get_local(register);
-                                        }
-                                        ctx.builder.get_local(&ctx.instruction_counter);
-                                        if let Some(limit) = &ctx.instruction_limit {
-                                            ctx.builder.get_local(limit);
-                                        }
-                                        else {
-                                            ctx.builder.const_i32(-1);
-                                        }
-                                        ctx.builder.get_local(&target_idx);
-                                        ctx.builder.const_i32(
-                                            (cpu::WASM_TABLE_OFFSET + WASM_TABLE_SIZE) as i32,
-                                        );
-                                        ctx.builder.add_i32();
-                                        ctx.builder.return_call_chain();
-                                    }
-                                    ctx.builder.free_local(target_idx);
-                                }
-                                ctx.builder.block_end();
-                                ctx.builder.free_local(state);
-                            }
+                            ctx.builder.br(ctx.exit_label);
                             ctx.builder.block_end();
                         }
-                        ctx.builder.block_end();
-                        ctx.builder.block_end();
-                        ctx.builder.free_local(code);
-                        ctx.builder.free_local(virt_address);
-                        codegen::gen_profiler_stat_increment(
-                            ctx.builder,
-                            stat::INDIRECT_JUMP_NO_ENTRY,
+                        codegen::gen_move_registers_from_locals_to_memory(ctx);
+                        codegen::gen_update_instruction_counter(ctx);
+                        if let Some(limit) = &ctx.instruction_limit {
+                            // The counter local restarts at zero below, so
+                            // fold the budget it already consumed plus the one
+                            // instruction the helper retires into the limit:
+                            // later block checks then see the remaining budget.
+                            // The k=1 check above guarantees no underflow.
+                            ctx.builder.get_local(limit);
+                            ctx.builder.get_local(&ctx.instruction_counter);
+                            ctx.builder.sub_i32();
+                            ctx.builder.const_i32(1);
+                            ctx.builder.sub_i32();
+                            ctx.builder.set_local(limit);
+                        }
+                        ctx.builder.const_i32(0);
+                        ctx.builder.set_local(&ctx.instruction_counter);
+                        ctx.builder.call_fn0_ret("vine_jit_boundary_step");
+                        let status = ctx.builder.tee_new_local();
+                        codegen::gen_move_registers_from_memory_to_locals(ctx);
+                        ctx.builder.get_local(&status);
+                        ctx.builder.const_i32(0);
+                        ctx.builder.eq_i32();
+                        ctx.builder.if_void();
+                        gen_indirect_jump_tail(
+                            ctx,
+                            state_flags,
+                            wasm_table_index,
+                            main_loop_label,
+                            target_block,
+                            step_addr,
                         );
-
-                        codegen::gen_debug_track_jit_exit(ctx.builder, block.last_instruction_addr);
-                        gen_chain_to_cached_entry(ctx, state_flags);
+                        ctx.builder.block_end();
+                        ctx.builder.free_local(status);
+                        // status != 0: stop reason, fault, hlt or unfinished
+                        // prefix state — leave; the main loop handles it.
+                        codegen::gen_debug_track_jit_exit(ctx.builder, step_addr);
                         ctx.builder.br(ctx.exit_label);
                     },
                     &BasicBlockType::Normal {
@@ -2985,6 +3172,169 @@ fn instruction_keeps_vec_cache(cpu: &CpuContext) -> bool {
     }
 }
 
+/// Shared tail for BasicBlockType::AbsoluteEip and BoundaryStep:
+/// dispatch on the eip already published in memory — enter another block of
+/// this module when the entry exists, chain to another module's entry, or
+/// leave through the normal exit.
+fn gen_indirect_jump_tail(
+    ctx: &mut JitContext,
+    state_flags: CachedStateFlags,
+    wasm_table_index: WasmTableIndex,
+    main_loop_label: Label,
+    target_block: &WasmLocal,
+    last_instruction_addr: u32,
+) {
+    codegen::gen_profiler_stat_increment(ctx.builder, stat::INDIRECT_JUMP);
+    codegen::gen_get_eip(ctx.builder);
+    let virt_address = ctx.builder.tee_new_local();
+    ctx.builder.get_local(&virt_address);
+    ctx.builder.const_i32(12);
+    ctx.builder.shr_u_i32();
+    ctx.builder.const_i32(2);
+    ctx.builder.shl_i32();
+    ctx.builder
+        .load_aligned_i32(unsafe { &cpu::tlb_code[0] as *const Option<NonNull<cpu::Code>> as u32 });
+    let code = ctx.builder.tee_new_local();
+    ctx.builder.if_void();
+    {
+        ctx.builder.get_local(&code);
+        ctx.builder
+            .load_u8(std::mem::offset_of!(cpu::Code, state_flags) as u32);
+        ctx.builder.const_i32(state_flags.to_u32() as i32);
+        ctx.builder.eq_i32();
+        ctx.builder.if_void();
+        {
+            ctx.builder.get_local(&code);
+            ctx.builder.get_local(&virt_address);
+            ctx.builder.const_i32(0xFFF);
+            ctx.builder.and_i32();
+            ctx.builder.const_i32(1);
+            ctx.builder.shl_i32();
+            ctx.builder.add_i32();
+            ctx.builder
+                .load_aligned_u16(std::mem::offset_of!(cpu::Code, state_table) as u32);
+            let state = ctx.builder.tee_new_local();
+            ctx.builder.const_i32(u16::MAX as i32);
+            ctx.builder.ne_i32();
+            ctx.builder.if_void();
+            {
+                ctx.builder.get_local(&code);
+                ctx.builder
+                    .load_aligned_u16(std::mem::offset_of!(cpu::Code, wasm_table_index) as u32);
+                let target_idx = ctx.builder.tee_new_local();
+                ctx.builder.const_i32(wasm_table_index.to_u16() as i32);
+                ctx.builder.eq_i32();
+                ctx.builder.if_void();
+                {
+                    ctx.builder.get_local(&state);
+                    ctx.builder.set_local(target_block);
+                    ctx.builder.br(main_loop_label);
+                }
+                ctx.builder.block_end();
+
+                if unsafe { JIT_CG_OPTIONS } & 1 != 0 {
+                    // target_idx differs from this module's here
+                    // (the check above branched otherwise), so chain
+                    // directly with the already loaded state/index.
+                    // Nothing between those loads and this point can
+                    // invalidate them: only local.get/tee, constants
+                    // and branches — no calls, stores or fallible
+                    // helpers (the same invariant
+                    // gen_chain_to_cached_entry documents).
+                    if ctx.builder.is_chained() {
+                        codegen::gen_profiler_stat_increment(
+                            ctx.builder,
+                            stat::INDIRECT_JUMP_NO_ENTRY,
+                        );
+                        codegen::gen_debug_track_jit_exit(ctx.builder, last_instruction_addr);
+                        ctx.builder.get_local(&state);
+                        for register in ctx.register_locals.iter() {
+                            ctx.builder.get_local(register);
+                        }
+                        ctx.builder.get_local(&ctx.instruction_counter);
+                        if let Some(limit) = &ctx.instruction_limit {
+                            ctx.builder.get_local(limit);
+                        }
+                        else {
+                            ctx.builder.const_i32(-1);
+                        }
+                        ctx.builder.get_local(&target_idx);
+                        ctx.builder
+                            .const_i32((cpu::WASM_TABLE_OFFSET + WASM_TABLE_SIZE) as i32);
+                        ctx.builder.add_i32();
+                        ctx.builder.return_call_chain();
+                    }
+                }
+                else {
+                    ctx.builder.get_local(&code);
+                    ctx.builder
+                        .load_u8(std::mem::offset_of!(cpu::Code, state_flags) as u32);
+                    ctx.builder.const_i32(state_flags.to_u32() as i32);
+                    ctx.builder.eq_i32();
+                    ctx.builder.get_local(&code);
+                    ctx.builder
+                        .load_aligned_u16(std::mem::offset_of!(cpu::Code, wasm_table_index) as u32);
+                    ctx.builder.const_i32(wasm_table_index.to_u16() as i32);
+                    ctx.builder.eq_i32();
+                    ctx.builder.and_i32();
+                    ctx.builder.if_void();
+
+                    ctx.builder.get_local(&code);
+                    ctx.builder.get_local(&virt_address);
+                    ctx.builder.const_i32(0xFFF);
+                    ctx.builder.and_i32();
+                    ctx.builder.const_i32(1);
+                    ctx.builder.shl_i32();
+                    ctx.builder.add_i32();
+                    ctx.builder
+                        .load_aligned_u16(std::mem::offset_of!(cpu::Code, state_table) as u32);
+                    ctx.builder.tee_local(target_block);
+                    ctx.builder.const_i32(u16::MAX as i32);
+                    ctx.builder.ne_i32();
+                    ctx.builder.br_if(main_loop_label);
+
+                    if ctx.builder.is_chained() {
+                        codegen::gen_profiler_stat_increment(
+                            ctx.builder,
+                            stat::INDIRECT_JUMP_NO_ENTRY,
+                        );
+                        codegen::gen_debug_track_jit_exit(ctx.builder, last_instruction_addr);
+                        ctx.builder.get_local(&state);
+                        for register in ctx.register_locals.iter() {
+                            ctx.builder.get_local(register);
+                        }
+                        ctx.builder.get_local(&ctx.instruction_counter);
+                        if let Some(limit) = &ctx.instruction_limit {
+                            ctx.builder.get_local(limit);
+                        }
+                        else {
+                            ctx.builder.const_i32(-1);
+                        }
+                        ctx.builder.get_local(&target_idx);
+                        ctx.builder
+                            .const_i32((cpu::WASM_TABLE_OFFSET + WASM_TABLE_SIZE) as i32);
+                        ctx.builder.add_i32();
+                        ctx.builder.return_call_chain();
+                    }
+                    ctx.builder.block_end();
+                }
+                ctx.builder.free_local(target_idx);
+            }
+            ctx.builder.block_end();
+            ctx.builder.free_local(state);
+        }
+        ctx.builder.block_end();
+    }
+    ctx.builder.block_end();
+    ctx.builder.free_local(code);
+    ctx.builder.free_local(virt_address);
+    codegen::gen_profiler_stat_increment(ctx.builder, stat::INDIRECT_JUMP_NO_ENTRY);
+
+    codegen::gen_debug_track_jit_exit(ctx.builder, last_instruction_addr);
+    gen_chain_to_cached_entry(ctx, state_flags);
+    ctx.builder.br(ctx.exit_label);
+}
+
 fn jit_generate_basic_block(
     ctx: &mut JitContext,
     block: &BasicBlock,
@@ -3003,8 +3353,14 @@ fn jit_generate_basic_block(
     let last_instruction_addr = block.last_instruction_addr;
     let stop_addr = block.end_addr;
 
+    if block.number_of_instructions == 0 {
+        // step-only block: no instructions to compile; the
+        // BoundaryStep tail emits the whole block body.
+        dbg_assert!(matches!(block.ty, BasicBlockType::BoundaryStep { .. }));
+        return;
+    }
     // First iteration of do-while assumes the caller confirms this condition
-    dbg_assert!(!is_near_end_of_page(start_addr));
+    dbg_assert!(instruction_fits_in_page(start_addr, ctx.cpu));
 
     if cfg!(feature = "profiler") {
         ctx.builder.const_i32(start_addr as i32);
@@ -3135,14 +3491,17 @@ fn jit_generate_basic_block(
             break;
         }
 
-        if was_block_boundary || is_near_end_of_page(end_addr) || end_addr > stop_addr {
+        if was_block_boundary
+            || !instruction_fits_in_page(end_addr, ctx.cpu)
+            || end_addr > stop_addr
+        {
             dbg_log!(
-                "Overlapping basic blocks start={:x} expected_end={:x} end={:x} was_block_boundary={} near_end_of_page={}",
+                "Overlapping basic blocks start={:x} expected_end={:x} end={:x} was_block_boundary={} end_fits={}",
                 start_addr,
                 stop_addr,
                 end_addr,
                 was_block_boundary,
-                is_near_end_of_page(end_addr)
+                instruction_fits_in_page(end_addr, ctx.cpu)
             );
             dbg_assert!(false);
             break;
@@ -3175,10 +3534,20 @@ pub fn jit_increase_hotness_and_maybe_compile(
     let (hotness, entry_points) = ctx.entry_points.entry(page).or_insert_with(|| {
         cpu::tlb_set_has_code(page, true);
         profiler::stat_increment(stat::RUN_INTERPRETED_NEW_PAGE);
-        (0, HashSet::new())
+        (0, EntryPointSet::new())
     });
 
-    if register_entry && !is_near_end_of_page(phys_address) {
+    if register_entry
+        && instruction_fits_in_page(
+            phys_address,
+            &CpuContext {
+                eip: phys_address,
+                prefixes: 0,
+                cs_offset,
+                state_flags,
+            },
+        )
+    {
         entry_points.insert(phys_address as u16 & 0xFFF);
     }
 
@@ -3379,6 +3748,23 @@ pub fn jit_dirty_cache(start_addr: u32, end_addr: u32) {
 #[no_mangle]
 pub fn jit_dirty_page(page: Page) { jit_dirty_page_ctx(&mut get_jit_state(), page) }
 
+/// The main loop reports each guard bail for the page of the bailing
+/// instruction. A page reaching JIT_GUARD_BAIL_LIMIT is added to the
+/// guard-exit-disabled set and its generated code is invalidated through the
+/// usual per-page entry point, so its next compile uses the rejoining
+/// slow-helper shape.
+pub fn jit_record_guard_bail(page: Page) {
+    let mut ctx = get_jit_state();
+    let count = ctx.guard_bail_counts.entry(page).or_insert(0);
+    *count += 1;
+    if *count < unsafe { JIT_GUARD_BAIL_LIMIT } {
+        return;
+    }
+    if ctx.guard_exit_disabled.insert(page) {
+        jit_dirty_page_ctx(&mut ctx, page);
+    }
+}
+
 /// dirty pages in the range of start_addr and end_addr, which must span at most two pages
 pub fn jit_dirty_cache_small(start_addr: u32, end_addr: u32) {
     dbg_assert!(start_addr < end_addr);
@@ -3413,6 +3799,9 @@ fn jit_clear_cache(ctx: &mut JitState) {
     for page in pages_with_code {
         jit_dirty_page_ctx(ctx, page);
     }
+
+    ctx.guard_bail_counts.clear();
+    ctx.guard_exit_disabled.clear();
 }
 
 pub fn jit_page_has_code(page: Page) -> bool { jit_page_has_code_ctx(&mut get_jit_state(), page) }
@@ -3523,6 +3912,15 @@ pub fn enter_basic_block(phys_eip: u32) {
     }
 }
 
+// set_jit_config indices:
+//    0  jit disabled                        10 x87 typed value runs
+//    1  primary pages/module (0 = auto)     11 x87 run max ops
+//    2  loop-safety counter                 12 x87 run max addresses
+//    3  extra basic blocks                  14 guard-exit bits
+//    4  exact instruction budget            16 guard-exit bail limit
+//    5  entry heat threshold                17 boundary steps on/off
+//    6  synchronous finalize                18 codegen A/B bits
+//    7  copied leaf pages
 #[no_mangle]
 pub unsafe fn set_jit_config(index: u32, value: u32) {
     match index {
@@ -3543,6 +3941,10 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         // set.
         11 => JIT_X87_MAX_OPS = value.clamp(3, 128),
         12 => JIT_X87_MAX_ADDRESSES = value.clamp(1, 40),
+        14 => JIT_GUARD_EXIT = value,
+        16 => JIT_GUARD_BAIL_LIMIT = value,
+        17 => BOUNDARY_STEPS = value != 0,
+        18 => JIT_CG_OPTIONS = value & 3,
         _ => dbg_assert!(false),
     }
 }
@@ -3561,6 +3963,42 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         10 => JIT_X87_TYPED_RUNS as u32,
         11 => JIT_X87_MAX_OPS,
         12 => JIT_X87_MAX_ADDRESSES,
+        14 => JIT_GUARD_EXIT,
+        16 => JIT_GUARD_BAIL_LIMIT,
+        17 => BOUNDARY_STEPS as u32,
+        18 => JIT_CG_OPTIONS,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod entry_point_set_tests {
+    use super::EntryPointSet;
+
+    #[test]
+    fn insert_contains_and_len() {
+        let mut set = EntryPointSet::new();
+        assert!(set.is_empty());
+        assert!(set.insert(0));
+        assert!(set.insert(0xFFF));
+        assert!(set.insert(300));
+        assert!(!set.insert(300));
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(0) && set.contains(0xFFF) && set.contains(300));
+        assert!(!set.contains(1) && !set.contains(0xFFE));
+        // offsets are masked to the 12-bit page-offset domain
+        assert!(!set.insert(0x1000));
+        assert!(set.contains(0));
+        assert_eq!(set.len(), 3);
+    }
+
+    #[test]
+    fn iter_yields_offsets_in_ascending_order() {
+        let mut set = EntryPointSet::new();
+        for offset in [0xF00u16, 3, 0xFFF, 64, 65, 0] {
+            set.insert(offset);
+        }
+        let collected: Vec<u16> = set.iter().collect();
+        assert_eq!(collected, vec![0, 3, 64, 65, 0xF00, 0xFFF]);
     }
 }

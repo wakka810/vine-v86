@@ -298,6 +298,7 @@ pub static mut jit_block_boundary: bool = false;
 const VINE_STOP_BUDGET: u32 = 1;
 const VINE_STOP_HALT: u32 = 2;
 const VINE_STOP_EXECUTE_PROTECTION: u32 = 3;
+const VINE_STOP_RUNTIME_DISPATCH: u32 = 4;
 const VINE_STOP_EXCEPTION_BASE: u32 = 0x100;
 const VINE_JIT_MIN_BUDGET: u32 = 4096;
 
@@ -316,8 +317,25 @@ static mut vine_unnatural_resumes_live: usize = 0;
 static mut vine_stop_error_code: i32 = -1;
 static mut vine_jit_instruction_limit_value: u32 = u32::MAX;
 static mut vine_jit_retired_instructions: u64 = 0;
+static mut vine_jit_invocations: u64 = 0;
+static mut vine_interpreted_entries: u64 = 0;
 static mut vine_interpreted_retired_instructions: u64 = 0;
+// Instructions stepped through vine_jit_boundary_step inside a module call:
+// counted in *instruction_counter and in vine_interpreted_retired_instructions
+// by the helper, and subtracted from the jit-side delta by the module caller.
+static mut vine_jit_boundary_steps: u64 = 0;
+static mut vine_host_call_base: u32 = 0;
+static mut vine_host_call_byte_length: u32 = 0;
+static mut vine_host_call_slot_mask: u32 = 0;
 pub static mut vine_jit_exact_instruction_budget: bool = true;
+/// Set by generated code (set_jit_config 14) when
+/// a common-memory guard exits the module before the instruction. The next
+/// cycle iteration interprets the block instead of re-entering generated
+/// code. Written from Wasm at a fixed address; cleared on entry to the
+/// interpreted run.
+pub static mut vine_guard_bail_pending: u8 = 0;
+/// Guard exits handled since reset; exported as vine_guard_bail_count().
+static mut vine_guard_bails: u64 = 0;
 
 unsafe fn vine_stop_exception(code: i32, error_code: Option<i32>) -> bool {
     if !vine_execution_active {
@@ -3270,8 +3288,30 @@ unsafe fn run_interpreted_with_budget(
     );
 }
 
+unsafe fn vine_handle_guard_bail(interpreter_budget: u32) {
+    debug_assert!(vine_guard_bail_pending != 0);
+    vine_guard_bail_pending = 0;
+    vine_guard_bails = vine_guard_bails.wrapping_add(1);
+    *previous_ip = *instruction_pointer;
+    let phys_addr = return_on_pagefault!(get_phys_eip());
+    jit::jit_record_guard_bail(Page::page_of(phys_addr));
+    let initial = *instruction_counter;
+    jit_run_interpreted(phys_addr, interpreter_budget);
+    vine_interpreted_retired_instructions = vine_interpreted_retired_instructions
+        .wrapping_add(u64::from(*instruction_counter - initial));
+}
+
 unsafe fn cycle_internal_with_budget(interpreter_budget: u32) {
     profiler::stat_increment(stat::CYCLE_INTERNAL);
+    if vine_guard_bail_pending != 0 {
+        // A common-memory guard failed and the generated module exited before
+        // the instruction with EIP at its start. Execute the block in the
+        // interpreter (no entry point registration, no heat): the interpreter
+        // performs the access - faults, MMIO and SMC handling - exactly as it
+        // does for uncompiled code, then normal dispatch continues.
+        vine_handle_guard_bail(interpreter_budget);
+        return;
+    }
     let mut jit_entry = None;
     let initial_eip = *instruction_pointer;
     let initial_state_flags = *state_flags;
@@ -3350,16 +3390,27 @@ unsafe fn cycle_internal_with_budget(interpreter_budget: u32) {
             in_jit = true;
         }
         vine_jit_instruction_limit_value = interpreter_budget;
+        let initial_boundary_steps = vine_jit_boundary_steps;
+        vine_jit_invocations = vine_jit_invocations.wrapping_add(1);
         wasm::call_indirect1(
             wasm_table_index as i32 + WASM_TABLE_OFFSET as i32,
             initial_state,
         );
         vine_jit_instruction_limit_value = u32::MAX;
-        vine_jit_retired_instructions = vine_jit_retired_instructions
-            .wrapping_add((*instruction_counter - initial_instruction_counter) as u64);
+        vine_jit_retired_instructions = vine_jit_retired_instructions.wrapping_add(
+            (*instruction_counter - initial_instruction_counter) as u64
+                - (vine_jit_boundary_steps - initial_boundary_steps),
+        );
         #[cfg(debug_assertions)]
         {
             in_jit = false;
+        }
+        if vine_guard_bail_pending != 0 {
+            // A common-memory guard exited the module before the instruction;
+            // interpret the rest of the block. Must run before the zero-delta
+            // fallback below, which would leave the flag set and uncounted.
+            vine_handle_guard_bail(interpreter_budget);
+            return;
         }
         if *instruction_counter == initial_instruction_counter {
             // The first block can exceed a small remaining budget. Its guard
@@ -3431,6 +3482,7 @@ pub unsafe fn get_phys_eip() -> OrPageFault<u32> {
 
 unsafe fn jit_run_interpreted(mut phys_addr: u32, instruction_limit: u32) {
     profiler::stat_increment(stat::RUN_INTERPRETED);
+    vine_interpreted_entries = vine_interpreted_entries.wrapping_add(1);
     dbg_assert!(!memory::in_mapped_range(phys_addr));
 
     jit_block_boundary = false;
@@ -3506,6 +3558,51 @@ unsafe fn jit_run_interpreted(mut phys_addr: u32, instruction_limit: u32) {
     }
 
     *instruction_counter += i;
+}
+
+/// Executes exactly one guest instruction on behalf of generated code
+/// (page-boundary instructions are stepped through the interpreter inside a
+/// compiled block). Preconditions, established by the calling module: guest
+/// registers, eip, lazy flags and the instruction counter are published in
+/// memory. Mirrors one jit_run_interpreted loop iteration without hotness or
+/// entry-point bookkeeping.
+///
+/// Returns 0 when execution may continue at the new *instruction_pointer, and
+/// nonzero when the main loop must see the outcome first: a pending page fault
+/// (get_phys_eip / execute-fetch validation error), a nonzero vine_stop_reason,
+/// in_hlt, or unfinished prefix state.
+#[no_mangle]
+pub unsafe fn vine_jit_boundary_step() -> u32 {
+    jit_block_boundary = false;
+    *previous_ip = *instruction_pointer;
+    let phys_addr = match get_phys_eip() {
+        Ok(p) => p,
+        Err(()) => {
+            // Page fault during the eip translation; counted like the
+            // interpreter's loop (the failed fetch retires nothing).
+            return 1;
+        },
+    };
+    let start_eip = *instruction_pointer;
+    if vine_validate_execute_fetch(start_eip as u32).is_err() {
+        // jit_run_interpreted counts the iteration it entered.
+        *instruction_counter += 1;
+        vine_jit_boundary_steps += 1;
+        vine_interpreted_retired_instructions =
+            vine_interpreted_retired_instructions.wrapping_add(1);
+        return 1;
+    }
+    let opcode = *memory::mem8.wrapping_add(phys_addr as usize) as i32;
+    *instruction_pointer += 1;
+    dbg_assert!(*prefixes == 0);
+    run_instruction(opcode | (*is_32 as i32) << 8);
+    *instruction_counter += 1;
+    vine_jit_boundary_steps += 1;
+    vine_interpreted_retired_instructions = vine_interpreted_retired_instructions.wrapping_add(1);
+    if *in_hlt || *prefixes != 0 || (vine_execution_active && vine_stop_reason != 0) {
+        return 1;
+    }
+    0
 }
 
 #[no_mangle]
@@ -3590,6 +3687,32 @@ pub unsafe fn do_many_cycles_native() {
 }
 
 #[no_mangle]
+pub unsafe fn vine_jit_boundary_step_count() -> f64 { vine_jit_boundary_steps as f64 }
+
+#[no_mangle]
+/// Number of generated-code invocations from the interpreter's dispatch loop.
+/// With boundary steps enabled a hot boundary instruction stays inside the
+/// module, so this stops growing in steady state; with them disabled the loop
+/// exits and re-enters once per boundary instruction.
+pub unsafe fn vine_jit_invocation_count() -> f64 { vine_jit_invocations as f64 }
+
+#[no_mangle]
+/// Number of times the interpreter's dispatch loop entered jit_run_interpreted.
+/// With boundary steps enabled a hot boundary instruction stays in generated
+/// code, so this stops growing in steady state; with them disabled the loop
+/// re-enters the interpreter once per boundary instruction.
+pub unsafe fn vine_interpreted_entry_count() -> f64 { vine_interpreted_entries as f64 }
+
+#[no_mangle]
+pub unsafe fn vine_guard_bail_count() -> f64 { vine_guard_bails as f64 }
+
+#[no_mangle]
+pub unsafe fn vine_guard_exit_sites() -> u32 { crate::jit::GUARD_EXIT_SITES }
+
+#[no_mangle]
+pub unsafe fn vine_guard_exit_kept() -> u32 { crate::jit::GUARD_KEPT_SITES }
+
+#[no_mangle]
 pub unsafe fn vine_jit_retired_instructions_low() -> u32 { vine_jit_retired_instructions as u32 }
 
 #[no_mangle]
@@ -3628,6 +3751,21 @@ pub unsafe fn vine_execute_budget(max_instructions: u32) -> u32 {
         && !*in_hlt
         && vine_stop_reason == 0
     {
+        let eip = *instruction_pointer as u32;
+        let offset = eip.wrapping_sub(vine_host_call_base);
+        if offset < vine_host_call_byte_length && offset & vine_host_call_slot_mask == 0 {
+            *previous_ip = *instruction_pointer;
+            if get_phys_eip().is_err() {
+                break;
+            }
+            *instruction_counter += 1;
+            vine_interpreted_retired_instructions =
+                vine_interpreted_retired_instructions.wrapping_add(1);
+            if vine_validate_execute_fetch(eip).is_ok() {
+                vine_stop_reason = VINE_STOP_RUNTIME_DISPATCH;
+            }
+            break;
+        }
         let executed = (*instruction_counter).wrapping_sub(initial_instruction_counter);
         cycle_internal_with_budget(max_instructions - executed);
     }
@@ -3641,6 +3779,25 @@ pub unsafe fn vine_execute_budget(max_instructions: u32) -> u32 {
 
 #[no_mangle]
 pub unsafe fn vine_get_stop_error_code() -> i32 { vine_stop_error_code }
+
+/// The runtime installs an immutable UD2 at the start of each slot. A fetch
+/// there retires one instruction and returns at the endpoint. Bytes between
+/// endpoints keep their ordinary instruction and fault semantics.
+#[no_mangle]
+pub unsafe fn vine_set_host_call_range(base: u32, byte_length: u32, slot_size: u32) -> u32 {
+    if vine_execution_active
+        || slot_size < 2
+        || !slot_size.is_power_of_two()
+        || byte_length % slot_size != 0
+        || u64::from(base) + u64::from(byte_length) > 1 << 32
+    {
+        return 1;
+    }
+    vine_host_call_slot_mask = slot_size - 1;
+    vine_host_call_base = base;
+    vine_host_call_byte_length = byte_length;
+    0
+}
 
 // Same stopped context: the host only completed an API/callback return. Paging,
 // segments, flags and the rest of the architectural state remain unchanged.

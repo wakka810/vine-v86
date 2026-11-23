@@ -149,3 +149,48 @@ for(const enabled of [false, true]) {
     }
 }
 console.log("pending compilation: both ABI mode changes reject stale finalization");
+
+// The fused indirect-jump tail chains cross-module transfers
+// directly with the state and table index it already loaded. The same
+// indirect call/ret between two pages must produce identical architectural
+// state, identical retired accounting and the same native transfers under
+// every setting of config 18; enabling bit 0 must change the generated module
+// (the dead re-dispatch and duplicate tlb_code/state lookup are gone).
+{
+    const parts = [[A, [0xb9, ...u32(B), 0xff, 0xd1, 0x40, ...jump(A + 8, A)]],
+        [B, [0x43, 0xc3]]];
+    const budgets = [131072, 131072, 131072, 131072, 4096, 1, 7, 131072];
+    const runs = {};
+    for(const cg of [0, 1, 2, 3]) {
+        const interpreter = create_cpu(program(parts), { disable_jit: true });
+        const captured = [];
+        const cpu = create_cpu(program(parts), { chaining: true,
+            on_finalize(w, args) {
+                captured.push(Buffer.from(w.memory.buffer, args[3], args[4]).toString("hex"));
+            } });
+        cpu.wasm.set_jit_config(18, cg);
+        assert.equal(cpu.wasm.get_jit_config(18), cg, "config 18 must round-trip");
+        for(const budget of budgets) {
+            assert.equal(cpu.execute(budget).reason, 1, `cg=${cg}: budget exit`);
+            interpreter.execute(budget);
+        }
+        const { jit, interpreted, ...actual } = cpu.full_snapshot();
+        const { jit: jit_b, interpreted: interpreted_b, ...expected } = interpreter.full_snapshot();
+        // PREVIOUS_EIP is not architectural at a budget exit.
+        actual.state = actual.state.filter((_, index) => index !== 11);
+        expected.state = expected.state.filter((_, index) => index !== 11);
+        assert.deepEqual(actual, expected, `cg=${cg}: state must match the interpreter`);
+        assert(cpu.counts.chain_entries > 0, `cg=${cg}: indirect transfers must chain`);
+        assert(cpu.counts.entries < 40,
+            `cg=${cg}: native chaining must avoid the CPU dispatcher`);
+        runs[cg] = { modules: captured.slice().sort(), transfers: cpu.counts.chain_entries };
+        cpu.assert_hoisted();
+    }
+    assert.equal(runs[1].transfers, runs[0].transfers,
+        "bit 0 must chain the same transfers");
+    assert.equal(runs[3].transfers, runs[0].transfers,
+        "both bits must chain the same transfers");
+    assert.notDeepEqual(runs[1].modules, runs[0].modules,
+        "bit 0 must change the generated module");
+    console.log("direct fused chaining: identical state and transfers across config 18 = 0..3");
+}

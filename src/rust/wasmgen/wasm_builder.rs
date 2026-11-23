@@ -680,7 +680,7 @@ impl WasmBuilder {
     }
 
     #[must_use = "local allocated but not used"]
-    fn alloc_local(&mut self) -> WasmLocal {
+    pub fn alloc_local(&mut self) -> WasmLocal {
         match self.free_locals_i32.pop() {
             Some(local) => local,
             None => {
@@ -1291,10 +1291,22 @@ impl WasmBuilder {
         self.instruction_body.push(op::TYPE_I64);
     }
     #[allow(dead_code)]
-    pub fn block_i32(&mut self) {
-        self.open_block();
+    pub fn block_i32(&mut self) -> Label {
         self.instruction_body.push(op::OP_BLOCK);
         self.instruction_body.push(op::TYPE_I32);
+        self.open_block()
+    }
+    #[allow(dead_code)]
+    pub fn block_i64(&mut self) -> Label {
+        self.instruction_body.push(op::OP_BLOCK);
+        self.instruction_body.push(op::TYPE_I64);
+        self.open_block()
+    }
+    #[allow(dead_code)]
+    pub fn block_v128(&mut self) -> Label {
+        self.instruction_body.push(op::OP_BLOCK);
+        self.instruction_body.push(op::TYPE_V128);
+        self.open_block()
     }
 
     pub fn if_void(&mut self) {

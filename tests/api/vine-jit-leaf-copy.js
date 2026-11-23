@@ -18,8 +18,10 @@ function make(options,leaf,code=fixture(leaf)) {
   ...options,paging:true,...(cpu_module?{cpu_module}:{}),
   on_finalize(_wasm,args){records[i].push({index:args[0],start:args[1],flags:args[2]});},
  }));
- // A one-page build provides the no-copy comparison when no frozen CPU is supplied.
- if(!reference_module)cpus[1].wasm.set_jit_config(1,1);
+ // The no-copy comparison disables copied leaves directly; MAX_PAGES=1 alone
+ // no longer disables them (the copied-leaf limit is independent of the
+ // primary page limit).
+ if(!reference_module)cpus[1].wasm.set_jit_config(7,0);
  function cached(i,address) {
   return [...new Set(records[i].filter(({index,flags})=>
    cpus[i].wasm.jit_find_cache_entry_in_page(V+address,index,flags)>=0).map(r=>r.index))];
@@ -66,6 +68,25 @@ for(const asynchronous of [false,true]) for(const chaining of [false,true]) {
  assert.equal(cached(0,A).length,0,"callee write retires copied caller");
  await resume(B);await resume(A,100000);
  console.log(JSON.stringify({asynchronous,chaining,entries,transfers,passed:"identity, bounded copy, exact budgets, counter wrap, caller/callee retirement, warm reuse, all CPU/memory"}));
+}
+
+for(const asynchronous of [false,true]) {
+ // MAX_PAGES=1 no longer disables the copied-leaf machinery: a one-page
+ // caller module still folds the leaf callee, with results identical to
+ // the no-copy comparison CPU.
+ const pair=make({asynchronous,chaining:true});
+ for(const c of pair.cpus)c.wasm.set_jit_config(1,1);
+ await pair.resume(B);await pair.resume(B+0x20);
+ const target=pair.cached(0,B);assert.equal(target.length,1);
+ await pair.resume(A,1);
+ await pair.resume(A,100000);
+ for(const c of pair.cpus)c.resume(0,A);
+ const before=pair.cpus.map(c=>({...c.counts}));
+ pair.compare(100000,"one-page copied leaf");
+ const transfers=pair.cpus.map((c,i)=>c.counts.chain_entries-before[i].chain_entries);
+ assert.equal(transfers[0],0,"one-page caller keeps the copied callee in its module");
+ assert(transfers[1]>20000,"the no-copy comparison still enters the callee module");
+ console.log("MAX_PAGES=1 (async="+asynchronous+"): leaf callee still copied into the one-page caller, state identical");
 }
 
 for(const asynchronous of [false,true]) {
@@ -116,6 +137,9 @@ for(const asynchronous of [false,true]) {
  code.set([0xe8,...u32(C-B-5),0xc3],B-A);
  code.set([0x40,0xc3],B-A+0x20);code.set([0x40,0xc3],C-A);
  const pair=make({asynchronous:true,chaining:true},undefined,code);
+ // This case is about a callee primary lost through another page folded into
+ // the same module: B's module must cover B and C (the non-Vine default).
+ for(const c of pair.cpus)c.wasm.set_jit_config(1,3);
  await pair.resume(B);await pair.resume(B+0x20);
  assert(pair.cached(0,B+0x20).length>0,"callee primary exists before pending copy");
  const queued=[],original=globalThis.queueMicrotask;

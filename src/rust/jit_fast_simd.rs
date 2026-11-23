@@ -6,6 +6,7 @@
 // leaving at least one iteration (or any boundary/faulting iteration) for the
 // standard basic block epilogue, which preserves exact architectural flags,
 // page faults, SMC barriers, and instruction budget accounting.
+use crate::codegen;
 use crate::cpu::global_pointers as gp;
 use crate::cpu_context::CpuContext;
 use crate::jit::{BasicBlock, BasicBlockType, JitContext};
@@ -2136,6 +2137,9 @@ pub fn generate_loop(
     else {
         return;
     };
+    // With the memarg fold the arena base rides in the memarg of every
+    // access instead of being added into the pointer locals.
+    let simd_extra = if codegen::common_memarg_base(ctx).is_some() { common_base } else { 0 };
     let Some(plan) = scan(ctx.cpu, block, fallthrough_loop, skip_loop)
     else {
         return;
@@ -2293,9 +2297,14 @@ pub fn generate_loop(
         ctx.builder.br_if(skip_fast);
 
         ctx.builder.get_local(&inv_va);
-        ctx.builder.const_i32(common_base as i32);
-        ctx.builder.add_i32();
-        ctx.builder.load_unaligned_i32(0);
+        if simd_extra == 0 {
+            ctx.builder.const_i32(common_base as i32);
+            ctx.builder.add_i32();
+            ctx.builder.load_unaligned_i32(0);
+        }
+        else {
+            ctx.builder.load_unaligned_i32(simd_extra);
+        }
         inv_val_locals.push(ctx.builder.set_new_local());
         inv_page_locals.push(inv_page);
         ctx.builder.free_local(inv_va);
@@ -2350,8 +2359,10 @@ pub fn generate_loop(
         table_page_locals.push(hi_page);
 
         ctx.builder.get_local(&region_lo);
-        ctx.builder.const_i32(common_base as i32);
-        ctx.builder.add_i32();
+        if simd_extra == 0 {
+            ctx.builder.const_i32(common_base as i32);
+            ctx.builder.add_i32();
+        }
         table_ptr_locals.push(ctx.builder.set_new_local());
         ctx.builder.free_local(region_lo);
         ctx.builder.free_local(region_hi);
@@ -2553,8 +2564,10 @@ pub fn generate_loop(
 
         // Convert to Wasm linear memory pointer.
         ctx.builder.get_local(&va);
-        ctx.builder.const_i32(common_base as i32);
-        ctx.builder.add_i32();
+        if simd_extra == 0 {
+            ctx.builder.const_i32(common_base as i32);
+            ctx.builder.add_i32();
+        }
         ctx.builder.set_local(ptr_locals[s_idx].as_ref().unwrap());
 
         ctx.builder.free_local(page_off);
@@ -2614,7 +2627,7 @@ pub fn generate_loop(
                     ctx.builder.shl_i32();
                 }
                 ctx.builder.add_i32();
-                ctx.builder.load_unaligned_v128_zero64(0);
+                ctx.builder.load_unaligned_v128_zero64(simd_extra);
                 ctx.builder.set_local_v128(vec_local(dst));
                 if let VecReg::Mm(r) = dst {
                     mm_zero_hi |= 1 << r;
@@ -2624,7 +2637,7 @@ pub fn generate_loop(
                 let rel = (mem.offset as i64 - plan.streams[mem.stream].min_offset as i64) as u32;
                 ctx.builder
                     .get_local(ptr_locals[mem.stream].as_ref().unwrap());
-                ctx.builder.load_unaligned_v128(rel);
+                ctx.builder.load_unaligned_v128(rel + simd_extra);
                 ctx.builder
                     .set_local_v128(xmm_locals[r as usize].as_ref().unwrap());
             },
@@ -2634,13 +2647,13 @@ pub fn generate_loop(
                     .get_local(ptr_locals[mem.stream].as_ref().unwrap());
                 ctx.builder
                     .get_local_v128(xmm_locals[r as usize].as_ref().unwrap());
-                ctx.builder.store_unaligned_v128(rel);
+                ctx.builder.store_unaligned_v128(rel + simd_extra);
             },
             Op::Load64Zero(dst, mem) => {
                 let rel = (mem.offset as i64 - plan.streams[mem.stream].min_offset as i64) as u32;
                 ctx.builder
                     .get_local(ptr_locals[mem.stream].as_ref().unwrap());
-                ctx.builder.load_unaligned_v128_zero64(rel);
+                ctx.builder.load_unaligned_v128_zero64(rel + simd_extra);
                 ctx.builder.set_local_v128(vec_local(dst));
                 if let VecReg::Mm(r) = dst {
                     mm_zero_hi |= 1 << r;
@@ -2651,13 +2664,13 @@ pub fn generate_loop(
                 ctx.builder
                     .get_local(ptr_locals[mem.stream].as_ref().unwrap());
                 ctx.builder.get_local_v128(vec_local(src));
-                ctx.builder.store_unaligned_v128_lane64(rel, 0);
+                ctx.builder.store_unaligned_v128_lane64(rel + simd_extra, 0);
             },
             Op::Load32Zero(dst, mem) => {
                 let rel = (mem.offset as i64 - plan.streams[mem.stream].min_offset as i64) as u32;
                 ctx.builder
                     .get_local(ptr_locals[mem.stream].as_ref().unwrap());
-                ctx.builder.load_unaligned_v128_zero32(rel);
+                ctx.builder.load_unaligned_v128_zero32(rel + simd_extra);
                 ctx.builder.set_local_v128(vec_local(dst));
                 if let VecReg::Mm(r) = dst {
                     mm_zero_hi |= 1 << r;
@@ -2669,7 +2682,7 @@ pub fn generate_loop(
                     .get_local(ptr_locals[mem.stream].as_ref().unwrap());
                 ctx.builder.get_local_v128(vec_local(src));
                 ctx.builder.extract_i32x4_lane(0);
-                ctx.builder.store_unaligned_i32(rel);
+                ctx.builder.store_unaligned_i32(rel + simd_extra);
             },
             Op::MovVec(dst, src) => {
                 if dst != src {
@@ -2757,10 +2770,10 @@ pub fn generate_loop(
                 emit_simd_binop(ctx.builder, binop, is_sse, dst_l, |b| {
                     b.get_local(ptr_l);
                     if is_sse {
-                        b.load_unaligned_v128(rel);
+                        b.load_unaligned_v128(rel + simd_extra);
                     }
                     else {
-                        b.load_unaligned_v128_zero64(rel);
+                        b.load_unaligned_v128_zero64(rel + simd_extra);
                     }
                 });
                 if let VecReg::Mm(r) = dst {
@@ -2897,10 +2910,10 @@ pub fn generate_loop(
                 ctx.builder
                     .get_local(ptr_locals[mem.stream].as_ref().unwrap());
                 if is_sse {
-                    ctx.builder.load_unaligned_v128(rel);
+                    ctx.builder.load_unaligned_v128(rel + simd_extra);
                 }
                 else {
-                    ctx.builder.load_unaligned_v128_zero64(rel);
+                    ctx.builder.load_unaligned_v128_zero64(rel + simd_extra);
                 }
                 let v = ctx.builder.tee_new_local_v128();
                 ctx.builder.get_local_v128(&v);
@@ -2915,7 +2928,7 @@ pub fn generate_loop(
                 let rel = (mem.offset as i64 - plan.streams[mem.stream].min_offset as i64) as u32;
                 ctx.builder
                     .get_local(ptr_locals[mem.stream].as_ref().unwrap());
-                ctx.builder.load_unaligned_i32(rel);
+                ctx.builder.load_unaligned_i32(rel + simd_extra);
                 ctx.builder.set_local(&ctx.register_locals[r as usize]);
             },
             Op::GprLoadInv32(r, slot) => {
@@ -2926,14 +2939,14 @@ pub fn generate_loop(
                 let rel = (mem.offset as i64 - plan.streams[mem.stream].min_offset as i64) as u32;
                 ctx.builder
                     .get_local(ptr_locals[mem.stream].as_ref().unwrap());
-                ctx.builder.load_u8(rel);
+                ctx.builder.load_u8(rel + simd_extra);
                 ctx.builder.set_local(&ctx.register_locals[r as usize]);
             },
             Op::GprLoadZx16(r, mem) => {
                 let rel = (mem.offset as i64 - plan.streams[mem.stream].min_offset as i64) as u32;
                 ctx.builder
                     .get_local(ptr_locals[mem.stream].as_ref().unwrap());
-                ctx.builder.load_unaligned_u16(rel);
+                ctx.builder.load_unaligned_u16(rel + simd_extra);
                 ctx.builder.set_local(&ctx.register_locals[r as usize]);
             },
             Op::GprStore32(mem, r) => {
@@ -2941,7 +2954,7 @@ pub fn generate_loop(
                 ctx.builder
                     .get_local(ptr_locals[mem.stream].as_ref().unwrap());
                 ctx.builder.get_local(&ctx.register_locals[r as usize]);
-                ctx.builder.store_unaligned_i32(rel);
+                ctx.builder.store_unaligned_i32(rel + simd_extra);
             },
             Op::GprMovReg(dst, src) => {
                 if dst != src {

@@ -8,6 +8,7 @@ use crate::jit::{Instruction, InstructionOperand, InstructionOperandDest, JitCon
 use crate::modrm;
 use crate::modrm::ModrmByte;
 use crate::opstats;
+use crate::page::Page;
 use crate::profiler;
 use crate::regs;
 use crate::wasmgen::wasm_builder::{WasmBuilder, WasmLocal, WasmLocalI64, WasmLocalV128};
@@ -228,6 +229,7 @@ pub fn gen_get_reg32(ctx: &mut JitContext, r: u32) {
 }
 
 pub fn gen_set_reg8(ctx: &mut JitContext, r: u32) {
+    ctx.instr_state_dirty = true;
     match r {
         regs::AL | regs::CL | regs::DL | regs::BL => {
             // reg32[r] = stack_value & 0xFF | reg32[r] & ~0xFF
@@ -262,6 +264,7 @@ pub fn gen_set_reg8(ctx: &mut JitContext, r: u32) {
 }
 
 pub fn gen_set_reg8_unmasked(ctx: &mut JitContext, r: u32) {
+    ctx.instr_state_dirty = true;
     if cfg!(debug_assertions) {
         let val = ctx.builder.set_new_local();
         ctx.builder.get_local(&val);
@@ -305,10 +308,12 @@ pub fn gen_set_reg8_unmasked(ctx: &mut JitContext, r: u32) {
 }
 
 pub fn gen_set_reg16(ctx: &mut JitContext, r: u32) {
+    ctx.instr_state_dirty = true;
     gen_set_reg16_local(ctx.builder, &ctx.register_locals[r as usize]);
 }
 
 pub fn gen_set_reg16_unmasked(ctx: &mut JitContext, r: u32) {
+    ctx.instr_state_dirty = true;
     if cfg!(debug_assertions) {
         let val = ctx.builder.set_new_local();
         ctx.builder.get_local(&val);
@@ -340,6 +345,7 @@ pub fn gen_set_reg16_local(builder: &mut WasmBuilder, local: &WasmLocal) {
 }
 
 pub fn gen_set_reg32(ctx: &mut JitContext, r: u32) {
+    ctx.instr_state_dirty = true;
     ctx.builder.set_local(&ctx.register_locals[r as usize]);
 }
 
@@ -444,6 +450,7 @@ pub fn gen_get_mmx_v128(ctx: &mut JitContext, r: u32) {
 }
 
 pub fn gen_set_mmx_v128(ctx: &mut JitContext, r: u32) {
+    ctx.instr_state_dirty = true;
     if let Some(ref local) = ctx.mmx_cache[r as usize] {
         ctx.builder.set_local_v128(local);
         ctx.mmx_dirty |= 1 << r;
@@ -492,6 +499,7 @@ pub fn gen_get_xmm_v128(ctx: &mut JitContext, r: u32) {
 }
 
 pub fn gen_set_xmm_v128(ctx: &mut JitContext, r: u32) {
+    ctx.instr_state_dirty = true;
     if let Some(ref local) = ctx.xmm_cache[r as usize] {
         ctx.builder.set_local_v128(local);
         ctx.xmm_dirty |= 1 << r;
@@ -900,22 +908,69 @@ pub fn gen_safe_write128_v128(
 // or the span bits (4 = read on this and the next page, 8 = write on both) for
 // wider accesses. Returns None when the common arena does not apply and the
 // caller must use gen_memory_guard's tlb_data path instead.
+// With config 18 bit 1, common-memory accesses fold the arena base
+// into the wasm memarg -- `load/store offset=base (address)` -- instead of
+// materialising `address + base` in a local. Memarg addressing uses
+// `zext(address) + base` without a 32-bit wrap; every address the guard
+// accepts lies inside the arena, so the sum stays within the wasm memory
+// and cannot wrap: the effective address equals the old wrapping add for
+// every accepted access.
+fn cg_memarg() -> bool { (unsafe { crate::jit::JIT_CG_OPTIONS } & 2) != 0 }
+
+// Headroom so every small positive access offset added on top of the folded
+// base (runs, x87 byte counts, SIMD streams) still fits the u32 memarg.
+const MEMARG_HEADROOM: u32 = 1 << 20;
+
+/// The arena base if common memory applies and the memarg fold is enabled
+/// for it; `None` means emit the `address + base` local.
+pub(crate) fn common_memarg_base(ctx: &JitContext) -> Option<u32> {
+    let (base, _) = unsafe { crate::cpu::vine::common_memory() }
+        .filter(|_| ctx.cpu.cpl3() && !cfg!(feature = "profiler"))?;
+    if cg_memarg() && base <= u32::MAX - MEMARG_HEADROOM {
+        Some(base)
+    }
+    else {
+        None
+    }
+}
+
+/// Access descriptor produced by a common-memory guard.
+pub(crate) enum MemOperand {
+    /// `local` holds the resolved wasm address; accesses use `offset=0`.
+    Resolved(WasmLocal),
+    /// Accesses use `get_local(address)` and `offset=base`.
+    Guest { base: u32 },
+}
+impl MemOperand {
+    pub fn extra(&self) -> u32 {
+        match self {
+            MemOperand::Resolved(_) => 0,
+            MemOperand::Guest { base } => *base,
+        }
+    }
+}
+
 fn gen_common_memory_guard(
     ctx: &mut JitContext,
     address: &WasmLocal,
-) -> Option<(WasmLocal, WasmLocal)> {
+) -> Option<(MemOperand, WasmLocal)> {
     let (base, permissions) = unsafe { crate::cpu::vine::common_memory() }
         .filter(|_| ctx.cpu.cpl3() && !cfg!(feature = "profiler"))?;
-    ctx.builder.get_local(address);
-    ctx.builder.const_i32(base as i32);
-    ctx.builder.add_i32();
-    let entry = ctx.builder.set_new_local();
+    let operand = if common_memarg_base(ctx).is_some() {
+        MemOperand::Guest { base }
+    }
+    else {
+        ctx.builder.get_local(address);
+        ctx.builder.const_i32(base as i32);
+        ctx.builder.add_i32();
+        MemOperand::Resolved(ctx.builder.set_new_local())
+    };
     ctx.builder.get_local(address);
     ctx.builder.const_i32(12);
     ctx.builder.shr_u_i32();
     ctx.builder.load_u8(permissions);
     let perm = ctx.builder.set_new_local();
-    Some((entry, perm))
+    Some((operand, perm))
 }
 
 // Emits `(perm & mask) == mask` on the operand stack.
@@ -947,14 +1002,19 @@ pub(crate) fn gen_memory_guard(
     address: &WasmLocal,
     read: bool,
     write: bool,
-) -> (WasmLocal, bool) {
+) -> (MemOperand, bool) {
     if let Some((base, permissions)) = unsafe { crate::cpu::vine::common_memory() }
         .filter(|_| ctx.cpu.cpl3() && !cfg!(feature = "profiler"))
     {
-        ctx.builder.get_local(address);
-        ctx.builder.const_i32(base as i32);
-        ctx.builder.add_i32();
-        let entry = ctx.builder.set_new_local();
+        let operand = if common_memarg_base(ctx).is_some() {
+            MemOperand::Guest { base }
+        }
+        else {
+            ctx.builder.get_local(address);
+            ctx.builder.const_i32(base as i32);
+            ctx.builder.add_i32();
+            MemOperand::Resolved(ctx.builder.set_new_local())
+        };
         ctx.builder.get_local(address);
         ctx.builder.const_i32(12);
         ctx.builder.shr_u_i32();
@@ -966,7 +1026,7 @@ pub(crate) fn gen_memory_guard(
             ctx.builder.const_i32(mask);
             ctx.builder.eq_i32();
         }
-        (entry, true)
+        (operand, true)
     }
     else {
         ctx.builder.get_local(address);
@@ -985,7 +1045,7 @@ pub(crate) fn gen_memory_guard(
         ctx.builder.and_i32();
         ctx.builder.const_i32(TLB_VALID);
         ctx.builder.eq_i32();
-        (entry, false)
+        (MemOperand::Resolved(entry), false)
     }
 }
 
@@ -1004,6 +1064,56 @@ pub(crate) fn gen_resolved_memory_address(
     }
 }
 
+/// Guard exits (set_jit_config 14): a failed common-memory guard
+/// exits the generated module instead of calling the rejoining slow helper;
+/// the main loop then interprets the instruction, which performs the access
+/// exactly as for uncompiled code. Eligible only while the whole instruction
+/// can still be re-executed exactly:
+/// - fault_precharge is Some, so the interpreter's retired-instruction
+///   accounting stays exact;
+/// - the instruction is on the generated block's own page (block_stop_addr is
+///   its end and is cleared for non-block contexts like emit_slow_call), so
+///   publishing eip with gen_set_eip_low_bits restores its start;
+/// - the block is not on a copied or inlined leaf page whose guest bytes may
+///   be rewritten before they run, and not inside a guarded memory run;
+/// - nothing emitted for the instruction so far changed architectural state
+///   other than a guest-memory access: no register local write
+///   (instr_state_dirty), no vector cache write and no imported call
+///   (callers like fpu_* or io helpers could mutate state or be observable
+///   on re-execution).
+fn gen_guard_bail_eligible(ctx: &mut JitContext) -> bool {
+    (unsafe { crate::jit::JIT_GUARD_EXIT }) & 1 != 0
+        && ctx.fault_precharge.is_some()
+        && !ctx.in_guarded_mem_run
+        && !ctx.copied_leaf_page
+        && ctx.block_stop_addr != 0
+        && Page::page_of(ctx.start_of_current_instruction) == Page::page_of(ctx.block_stop_addr)
+        && !ctx.instr_state_dirty
+        && ctx.builder.imported_call_count() == ctx.instr_calls_base
+        && !ctx
+            .guard_exit_disabled
+            .contains(&Page::page_of(ctx.start_of_current_instruction))
+}
+
+/// Emit the guard-exit arm for a failed common-memory guard: flush the
+/// vector cache, undo the block's pre-charge for the current and later
+/// instructions (the interpreter retires them), publish EIP at the
+/// instruction start, flag the bail and take the normal exit arm, which
+/// spills the register locals and publishes the instruction counter.
+fn gen_guard_bail(ctx: &mut JitContext) {
+    gen_vec_flush_for_cold_path(ctx);
+    ctx.builder.get_local(&ctx.instruction_counter);
+    ctx.builder.const_i32(ctx.fault_precharge.unwrap() as i32);
+    ctx.builder.sub_i32();
+    ctx.builder.set_local(&ctx.instruction_counter);
+    gen_set_eip_low_bits(ctx.builder, ctx.start_of_current_instruction as i32 & 0xFFF);
+    ctx.builder
+        .const_i32(&raw mut crate::cpu::cpu::vine_guard_bail_pending as i32);
+    ctx.builder.const_i32(1);
+    ctx.builder.store_u8(0);
+    ctx.builder.br(ctx.exit_label);
+}
+
 fn gen_safe_read(
     ctx: &mut JitContext,
     bits: BitSize,
@@ -1019,11 +1129,22 @@ fn gen_safe_read(
     //   if page_fault: goto exit-with-pagefault
     //   fast: mem[(entry & ~0xFFF) ^ addr]
 
+    // With the memarg fold the guard-passed fast path uses
+    // `load offset=base (address)`; the slow path resolves an absolute wasm
+    // address (possibly outside the arena) and keeps offset=0, so the two
+    // merge at a result block instead of sharing a tail.
+    let done = common_memarg_base(ctx).map(|_| match bits {
+        BitSize::DQWORD if where_to_write.is_some() => ctx.builder.block_void(),
+        BitSize::DQWORD => ctx.builder.block_v128(),
+        BitSize::QWORD => ctx.builder.block_i64(),
+        _ => ctx.builder.block_i32(),
+    });
     let cont = ctx.builder.block_void();
     let saved_mmx_cr0 = ctx.mmx_task_switch_call_count;
     let calls_before = ctx.builder.imported_call_count();
-    let (entry_local, common) =
-        if let Some((entry, perm)) = gen_common_memory_guard(ctx, address_local) {
+    let (operand, common, bail) =
+        if let Some((operand, perm)) = gen_common_memory_guard(ctx, address_local) {
+            let bail = gen_guard_bail_eligible(ctx);
             if bits == BitSize::BYTE {
                 // A single byte never crosses a page; read permission suffices.
                 gen_perm_mask_test(ctx, &perm, 1);
@@ -1041,128 +1162,145 @@ fn gen_safe_read(
             }
             ctx.builder.br_if(cont);
             ctx.builder.free_local(perm);
-            (entry, true)
+            (operand, true, bail)
         }
         else {
-            let (entry, common) = gen_memory_guard(ctx, address_local, true, false);
+            let (operand, common) = gen_memory_guard(ctx, address_local, true, false);
             if bits != BitSize::BYTE {
                 gen_within_page_test(ctx, address_local, bits.bytes() as i32);
                 ctx.builder.and_i32();
             }
             ctx.builder.br_if(cont);
-            (entry, common)
+            (operand, common, false)
         };
-
-    if cfg!(feature = "profiler") {
-        ctx.builder.get_local(&address_local);
-        ctx.builder.get_local(&entry_local);
-        ctx.builder.call_fn2("report_safe_read_jit_slow");
-    }
-
-    ctx.builder.get_local(&address_local);
-    ctx.builder
-        .const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
-    match bits {
-        BitSize::BYTE => {
-            ctx.builder.call_fn2_ret("safe_read8_slow_jit");
-        },
-        BitSize::WORD => {
-            ctx.builder.call_fn2_ret("safe_read16_slow_jit");
-        },
-        BitSize::DWORD => {
-            ctx.builder.call_fn2_ret("safe_read32s_slow_jit");
-        },
-        BitSize::QWORD => {
-            ctx.builder.call_fn2_ret("safe_read64s_slow_jit");
-        },
-        BitSize::DQWORD => {
-            ctx.builder.call_fn2_ret("safe_read128s_slow_jit");
-        },
-    }
-    ctx.builder.tee_local(&entry_local);
-    ctx.builder.const_i32(1);
-    ctx.builder.and_i32();
-
-    if cfg!(feature = "profiler") {
-        ctx.builder.if_void();
-        gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
-        ctx.builder.block_end();
-
-        ctx.builder.get_local(&entry_local);
-        ctx.builder.const_i32(1);
-        ctx.builder.and_i32();
-    }
-
-    if gen_vec_has_dirty(ctx) || ctx.fault_precharge.is_some() {
-        ctx.builder.if_void();
-        gen_vec_flush_for_cold_path(ctx);
-        if let Some(k) = ctx.fault_precharge {
-            // On a real CPU exception (bit 1 of the slow helper's exit code)
-            // undo the pre-charge for the instructions after the faulting one;
-            // the interpreter counts the faulting instruction as retired. A
-            // bail (bit 1 clear, e.g. SMC) keeps the full pre-charge exactly as
-            // before. gen_update_instruction_counter publishes the local.
-            if k > 1 {
-                ctx.builder.get_local(&ctx.instruction_counter);
-                ctx.builder.const_i32(k as i32 - 1);
-                ctx.builder.get_local(&entry_local);
-                ctx.builder.const_i32(1);
-                ctx.builder.shr_u_i32();
-                ctx.builder.const_i32(1);
-                ctx.builder.and_i32();
-                ctx.builder.mul_i32();
-                ctx.builder.sub_i32();
-                ctx.builder.set_local(&ctx.instruction_counter);
-            }
-        }
-        ctx.builder.br(ctx.exit_with_fault_label);
-        ctx.builder.block_end();
-    }
-    else {
-        ctx.builder.br_if(ctx.exit_with_fault_label);
-    }
-    if common {
-        gen_resolved_memory_address(ctx, &entry_local, address_local, false);
-        ctx.builder.set_local(&entry_local);
-        if saved_mmx_cr0 == Some(calls_before) {
-            ctx.mmx_task_switch_call_count = Some(ctx.builder.imported_call_count());
-        }
-    }
-
-    ctx.builder.block_end();
-
-    gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_READ_FAST); // XXX: Both fast and slow
-
-    gen_resolved_memory_address(ctx, &entry_local, address_local, common);
-
+    let entry_local = match &operand {
+        MemOperand::Resolved(l) => l.unsafe_clone(),
+        MemOperand::Guest { .. } => ctx.builder.alloc_local(),
+    };
     // where_to_write is only used by dqword
     dbg_assert!(where_to_write.is_none() || bits == BitSize::DQWORD);
-
-    match bits {
-        BitSize::BYTE => {
-            ctx.builder.load_u8(0);
-        },
-        BitSize::WORD => {
-            ctx.builder.load_unaligned_u16(0);
-        },
-        BitSize::DWORD => {
-            ctx.builder.load_unaligned_i32(0);
-        },
-        BitSize::QWORD => {
-            ctx.builder.load_unaligned_i64(0);
-        },
+    let emit_load = |ctx: &mut JitContext, offset: u32| match bits {
+        BitSize::BYTE => ctx.builder.load_u8(offset),
+        BitSize::WORD => ctx.builder.load_unaligned_u16(offset),
+        BitSize::DWORD => ctx.builder.load_unaligned_i32(offset),
+        BitSize::QWORD => ctx.builder.load_unaligned_i64(offset),
         BitSize::DQWORD => {
             if let Some(where_to_write) = where_to_write {
                 let virt_address_local = ctx.builder.set_new_local();
                 ctx.builder.const_i32(where_to_write as i32);
                 ctx.builder.get_local(&virt_address_local);
-                ctx.builder.load_unaligned_v128(0);
+                ctx.builder.load_unaligned_v128(offset);
                 ctx.builder.store_aligned_v128(0);
                 ctx.builder.free_local(virt_address_local);
             }
             else {
-                ctx.builder.load_unaligned_v128(0);
+                ctx.builder.load_unaligned_v128(offset);
             }
+        },
+    };
+
+    if common && bail {
+        unsafe { crate::jit::GUARD_EXIT_SITES = crate::jit::GUARD_EXIT_SITES.wrapping_add(1) };
+        gen_guard_bail(ctx);
+    }
+    else {
+        if common && (unsafe { crate::jit::JIT_GUARD_EXIT }) & 1 != 0 {
+            unsafe { crate::jit::GUARD_KEPT_SITES = crate::jit::GUARD_KEPT_SITES.wrapping_add(1) };
+        }
+        if cfg!(feature = "profiler") {
+            ctx.builder.get_local(&address_local);
+            ctx.builder.get_local(&entry_local);
+            ctx.builder.call_fn2("report_safe_read_jit_slow");
+        }
+
+        ctx.builder.get_local(&address_local);
+        ctx.builder
+            .const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
+        match bits {
+            BitSize::BYTE => {
+                ctx.builder.call_fn2_ret("safe_read8_slow_jit");
+            },
+            BitSize::WORD => {
+                ctx.builder.call_fn2_ret("safe_read16_slow_jit");
+            },
+            BitSize::DWORD => {
+                ctx.builder.call_fn2_ret("safe_read32s_slow_jit");
+            },
+            BitSize::QWORD => {
+                ctx.builder.call_fn2_ret("safe_read64s_slow_jit");
+            },
+            BitSize::DQWORD => {
+                ctx.builder.call_fn2_ret("safe_read128s_slow_jit");
+            },
+        }
+        ctx.builder.tee_local(&entry_local);
+        ctx.builder.const_i32(1);
+        ctx.builder.and_i32();
+
+        if cfg!(feature = "profiler") {
+            ctx.builder.if_void();
+            gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
+            ctx.builder.block_end();
+
+            ctx.builder.get_local(&entry_local);
+            ctx.builder.const_i32(1);
+            ctx.builder.and_i32();
+        }
+
+        if gen_vec_has_dirty(ctx) || ctx.fault_precharge.is_some() {
+            ctx.builder.if_void();
+            gen_vec_flush_for_cold_path(ctx);
+            if let Some(k) = ctx.fault_precharge {
+                // On a real CPU exception (bit 1 of the slow helper's exit code)
+                // undo the pre-charge for the instructions after the faulting one;
+                // the interpreter counts the faulting instruction as retired. A
+                // bail (bit 1 clear, e.g. SMC) keeps the full pre-charge exactly as
+                // before. gen_update_instruction_counter publishes the local.
+                if k > 1 {
+                    ctx.builder.get_local(&ctx.instruction_counter);
+                    ctx.builder.const_i32(k as i32 - 1);
+                    ctx.builder.get_local(&entry_local);
+                    ctx.builder.const_i32(1);
+                    ctx.builder.shr_u_i32();
+                    ctx.builder.const_i32(1);
+                    ctx.builder.and_i32();
+                    ctx.builder.mul_i32();
+                    ctx.builder.sub_i32();
+                    ctx.builder.set_local(&ctx.instruction_counter);
+                }
+            }
+            ctx.builder.br(ctx.exit_with_fault_label);
+            ctx.builder.block_end();
+        }
+        else {
+            ctx.builder.br_if(ctx.exit_with_fault_label);
+        }
+        if common {
+            gen_resolved_memory_address(ctx, &entry_local, address_local, false);
+            ctx.builder.set_local(&entry_local);
+            if saved_mmx_cr0 == Some(calls_before) {
+                ctx.mmx_task_switch_call_count = Some(ctx.builder.imported_call_count());
+            }
+        }
+        if let Some(done) = done {
+            ctx.builder.get_local(&entry_local);
+            emit_load(ctx, 0);
+            ctx.builder.br(done);
+        }
+    }
+    ctx.builder.block_end();
+
+    gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_READ_FAST); // XXX: Both fast and slow
+
+    match &operand {
+        MemOperand::Guest { base } => {
+            ctx.builder.get_local(address_local);
+            emit_load(ctx, *base);
+            ctx.builder.block_end();
+        },
+        MemOperand::Resolved(_) => {
+            gen_resolved_memory_address(ctx, &entry_local, address_local, common);
+            emit_load(ctx, 0);
         },
     }
 
@@ -1246,6 +1384,58 @@ pub fn gen_get_phys_eip_plus_mem(ctx: &mut JitContext, address_local: &WasmLocal
     ctx.builder.free_local(entry_local);
 }
 
+/// Emit `<push value>; store offset` for an operand already on the stack
+/// (resolved `entry` without the memarg fold, `get_local(address)` with
+/// `offset = base` under the memarg fold).
+fn gen_write_value_tail(
+    ctx: &mut JitContext,
+    bits: BitSize,
+    value_local: &GenSafeWriteValue,
+    offset: u32,
+) {
+    match *value_local {
+        GenSafeWriteValue::I32(local) => ctx.builder.get_local(local),
+        GenSafeWriteValue::I64(local) => ctx.builder.get_local_i64(local),
+        GenSafeWriteValue::TwoI64s(local1, local2) => {
+            assert!(bits == BitSize::DQWORD);
+
+            let virt_address_local = ctx.builder.tee_new_local();
+            ctx.builder.get_local_i64(local1);
+            ctx.builder.store_unaligned_i64(offset);
+
+            ctx.builder.get_local(&virt_address_local);
+            ctx.builder.get_local_i64(local2);
+            ctx.builder.store_unaligned_i64(offset + 8);
+            ctx.builder.free_local(virt_address_local);
+        },
+        GenSafeWriteValue::FixedV128(source_fixed_addr) => {
+            assert!(bits == BitSize::DQWORD);
+            ctx.builder.load_fixed_v128(source_fixed_addr);
+            ctx.builder.store_unaligned_v128(offset);
+        },
+        GenSafeWriteValue::V128(local) => {
+            assert!(bits == BitSize::DQWORD);
+            ctx.builder.get_local_v128(local);
+            ctx.builder.store_unaligned_v128(offset);
+        },
+    }
+    match bits {
+        BitSize::BYTE => {
+            ctx.builder.store_u8(offset);
+        },
+        BitSize::WORD => {
+            ctx.builder.store_unaligned_u16(offset);
+        },
+        BitSize::DWORD => {
+            ctx.builder.store_unaligned_i32(offset);
+        },
+        BitSize::QWORD => {
+            ctx.builder.store_unaligned_i64(offset);
+        },
+        BitSize::DQWORD => {}, // handled above
+    }
+}
+
 fn gen_safe_write(
     ctx: &mut JitContext,
     bits: BitSize,
@@ -1261,11 +1451,13 @@ fn gen_safe_write(
     //   if page_fault: goto exit-with-pagefault
     //   fast: mem[(entry & ~0xFFF) ^ addr] <- value
 
+    let done = common_memarg_base(ctx).map(|_| ctx.builder.block_void());
     let cont = ctx.builder.block_void();
     let saved_mmx_cr0 = ctx.mmx_task_switch_call_count;
     let calls_before = ctx.builder.imported_call_count();
-    let (entry_local, common) =
-        if let Some((entry, perm)) = gen_common_memory_guard(ctx, address_local) {
+    let (operand, common, bail) =
+        if let Some((operand, perm)) = gen_common_memory_guard(ctx, address_local) {
+            let bail = gen_guard_bail_eligible(ctx);
             if bits == BitSize::BYTE {
                 // A single byte never crosses a page; write permission suffices.
                 gen_perm_mask_test(ctx, &perm, 2);
@@ -1283,168 +1475,312 @@ fn gen_safe_write(
             }
             ctx.builder.br_if(cont);
             ctx.builder.free_local(perm);
-            (entry, true)
+            (operand, true, bail)
         }
         else {
-            let (entry, common) = gen_memory_guard(ctx, address_local, false, true);
+            let (operand, common) = gen_memory_guard(ctx, address_local, false, true);
             if bits != BitSize::BYTE {
                 gen_within_page_test(ctx, address_local, bits.bytes() as i32);
                 ctx.builder.and_i32();
             }
             ctx.builder.br_if(cont);
-            (entry, common)
+            (operand, common, false)
         };
+    let entry_local = match &operand {
+        MemOperand::Resolved(l) => l.unsafe_clone(),
+        MemOperand::Guest { .. } => ctx.builder.alloc_local(),
+    };
 
-    if cfg!(feature = "profiler") {
-        ctx.builder.get_local(&address_local);
-        ctx.builder.get_local(&entry_local);
-        ctx.builder.call_fn2("report_safe_write_jit_slow");
-    }
-
-    ctx.builder.get_local(&address_local);
-    match value_local {
-        GenSafeWriteValue::I32(local) => ctx.builder.get_local(local),
-        GenSafeWriteValue::I64(local) => ctx.builder.get_local_i64(local),
-        GenSafeWriteValue::TwoI64s(local1, local2) => {
-            ctx.builder.get_local_i64(local1);
-            ctx.builder.get_local_i64(local2)
-        },
-        GenSafeWriteValue::FixedV128(source_fixed_addr) => {
-            ctx.builder.load_fixed_i64(source_fixed_addr);
-            ctx.builder.load_fixed_i64(source_fixed_addr + 8);
-        },
-        GenSafeWriteValue::V128(local) => {
-            ctx.builder.get_local_v128(local);
-            ctx.builder.extract_i64x2_lane(0);
-            ctx.builder.get_local_v128(local);
-            ctx.builder.extract_i64x2_lane(1);
-        },
-    }
-
-    // packed lower bits of eip and wasm table index
-    ctx.builder.const_i32(
-        ctx.start_of_current_instruction as i32 & 0xFFF
-            | (ctx.wasm_table_index.to_u16() as i32) << 16,
-    );
-
-    match bits {
-        BitSize::BYTE => {
-            ctx.builder.call_fn3_ret("safe_write8_slow_jit");
-        },
-        BitSize::WORD => {
-            ctx.builder.call_fn3_ret("safe_write16_slow_jit");
-        },
-        BitSize::DWORD => {
-            ctx.builder.call_fn3_ret("safe_write32_slow_jit");
-        },
-        BitSize::QWORD => {
-            ctx.builder
-                .call_fn3_i32_i64_i32_ret("safe_write64_slow_jit");
-        },
-        BitSize::DQWORD => {
-            ctx.builder
-                .call_fn4_i32_i64_i64_i32_ret("safe_write128_slow_jit");
-        },
-    }
-    ctx.builder.tee_local(&entry_local);
-    ctx.builder.const_i32(1);
-    ctx.builder.and_i32();
-
-    if cfg!(feature = "profiler") {
-        ctx.builder.if_void();
-        gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
-        ctx.builder.block_end();
-
-        ctx.builder.get_local(&entry_local);
-        ctx.builder.const_i32(1);
-        ctx.builder.and_i32();
-    }
-
-    if gen_vec_has_dirty(ctx) || ctx.fault_precharge.is_some() {
-        ctx.builder.if_void();
-        gen_vec_flush_for_cold_path(ctx);
-        if let Some(k) = ctx.fault_precharge {
-            // On a real CPU exception (bit 1 of the slow helper's exit code)
-            // undo the pre-charge for the instructions after the faulting one;
-            // the interpreter counts the faulting instruction as retired. A
-            // bail (bit 1 clear, e.g. SMC) keeps the full pre-charge exactly as
-            // before. gen_update_instruction_counter publishes the local.
-            if k > 1 {
-                ctx.builder.get_local(&ctx.instruction_counter);
-                ctx.builder.const_i32(k as i32 - 1);
-                ctx.builder.get_local(&entry_local);
-                ctx.builder.const_i32(1);
-                ctx.builder.shr_u_i32();
-                ctx.builder.const_i32(1);
-                ctx.builder.and_i32();
-                ctx.builder.mul_i32();
-                ctx.builder.sub_i32();
-                ctx.builder.set_local(&ctx.instruction_counter);
-            }
-        }
-        ctx.builder.br(ctx.exit_with_fault_label);
-        ctx.builder.block_end();
+    if common && bail {
+        unsafe { crate::jit::GUARD_EXIT_SITES = crate::jit::GUARD_EXIT_SITES.wrapping_add(1) };
+        gen_guard_bail(ctx);
     }
     else {
-        ctx.builder.br_if(ctx.exit_with_fault_label);
-    }
-    if common {
-        gen_resolved_memory_address(ctx, &entry_local, address_local, false);
-        ctx.builder.set_local(&entry_local);
-        if saved_mmx_cr0 == Some(calls_before) {
-            ctx.mmx_task_switch_call_count = Some(ctx.builder.imported_call_count());
+        if common && (unsafe { crate::jit::JIT_GUARD_EXIT }) & 1 != 0 {
+            unsafe { crate::jit::GUARD_KEPT_SITES = crate::jit::GUARD_KEPT_SITES.wrapping_add(1) };
+        }
+        if cfg!(feature = "profiler") {
+            ctx.builder.get_local(&address_local);
+            ctx.builder.get_local(&entry_local);
+            ctx.builder.call_fn2("report_safe_write_jit_slow");
+        }
+
+        ctx.builder.get_local(&address_local);
+        match value_local {
+            GenSafeWriteValue::I32(local) => ctx.builder.get_local(local),
+            GenSafeWriteValue::I64(local) => ctx.builder.get_local_i64(local),
+            GenSafeWriteValue::TwoI64s(local1, local2) => {
+                ctx.builder.get_local_i64(local1);
+                ctx.builder.get_local_i64(local2)
+            },
+            GenSafeWriteValue::FixedV128(source_fixed_addr) => {
+                ctx.builder.load_fixed_i64(source_fixed_addr);
+                ctx.builder.load_fixed_i64(source_fixed_addr + 8);
+            },
+            GenSafeWriteValue::V128(local) => {
+                ctx.builder.get_local_v128(local);
+                ctx.builder.extract_i64x2_lane(0);
+                ctx.builder.get_local_v128(local);
+                ctx.builder.extract_i64x2_lane(1);
+            },
+        }
+
+        // packed lower bits of eip and wasm table index
+        ctx.builder.const_i32(
+            ctx.start_of_current_instruction as i32 & 0xFFF
+                | (ctx.wasm_table_index.to_u16() as i32) << 16,
+        );
+
+        match bits {
+            BitSize::BYTE => {
+                ctx.builder.call_fn3_ret("safe_write8_slow_jit");
+            },
+            BitSize::WORD => {
+                ctx.builder.call_fn3_ret("safe_write16_slow_jit");
+            },
+            BitSize::DWORD => {
+                ctx.builder.call_fn3_ret("safe_write32_slow_jit");
+            },
+            BitSize::QWORD => {
+                ctx.builder
+                    .call_fn3_i32_i64_i32_ret("safe_write64_slow_jit");
+            },
+            BitSize::DQWORD => {
+                ctx.builder
+                    .call_fn4_i32_i64_i64_i32_ret("safe_write128_slow_jit");
+            },
+        }
+        ctx.builder.tee_local(&entry_local);
+        ctx.builder.const_i32(1);
+        ctx.builder.and_i32();
+
+        if cfg!(feature = "profiler") {
+            ctx.builder.if_void();
+            gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
+            ctx.builder.block_end();
+
+            ctx.builder.get_local(&entry_local);
+            ctx.builder.const_i32(1);
+            ctx.builder.and_i32();
+        }
+
+        if gen_vec_has_dirty(ctx) || ctx.fault_precharge.is_some() {
+            ctx.builder.if_void();
+            gen_vec_flush_for_cold_path(ctx);
+            if let Some(k) = ctx.fault_precharge {
+                // On a real CPU exception (bit 1 of the slow helper's exit code)
+                // undo the pre-charge for the instructions after the faulting one;
+                // the interpreter counts the faulting instruction as retired. A
+                // bail (bit 1 clear, e.g. SMC) keeps the full pre-charge exactly as
+                // before. gen_update_instruction_counter publishes the local.
+                if k > 1 {
+                    ctx.builder.get_local(&ctx.instruction_counter);
+                    ctx.builder.const_i32(k as i32 - 1);
+                    ctx.builder.get_local(&entry_local);
+                    ctx.builder.const_i32(1);
+                    ctx.builder.shr_u_i32();
+                    ctx.builder.const_i32(1);
+                    ctx.builder.and_i32();
+                    ctx.builder.mul_i32();
+                    ctx.builder.sub_i32();
+                    ctx.builder.set_local(&ctx.instruction_counter);
+                }
+            }
+            ctx.builder.br(ctx.exit_with_fault_label);
+            ctx.builder.block_end();
+        }
+        else {
+            ctx.builder.br_if(ctx.exit_with_fault_label);
+        }
+        if common {
+            gen_resolved_memory_address(ctx, &entry_local, address_local, false);
+            ctx.builder.set_local(&entry_local);
+            if saved_mmx_cr0 == Some(calls_before) {
+                ctx.mmx_task_switch_call_count = Some(ctx.builder.imported_call_count());
+            }
+        }
+        if let Some(done) = done {
+            ctx.builder.get_local(&entry_local);
+            gen_write_value_tail(ctx, bits, &value_local, 0);
+            ctx.builder.br(done);
         }
     }
-
     ctx.builder.block_end();
 
     gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_WRITE_FAST); // XXX: Both fast and slow
 
-    gen_resolved_memory_address(ctx, &entry_local, address_local, common);
-
-    match value_local {
-        GenSafeWriteValue::I32(local) => ctx.builder.get_local(local),
-        GenSafeWriteValue::I64(local) => ctx.builder.get_local_i64(local),
-        GenSafeWriteValue::TwoI64s(local1, local2) => {
-            assert!(bits == BitSize::DQWORD);
-
-            let virt_address_local = ctx.builder.tee_new_local();
-            ctx.builder.get_local_i64(local1);
-            ctx.builder.store_unaligned_i64(0);
-
-            ctx.builder.get_local(&virt_address_local);
-            ctx.builder.get_local_i64(local2);
-            ctx.builder.store_unaligned_i64(8);
-            ctx.builder.free_local(virt_address_local);
+    match &operand {
+        MemOperand::Guest { base } => {
+            ctx.builder.get_local(address_local);
+            gen_write_value_tail(ctx, bits, &value_local, *base);
+            ctx.builder.block_end();
         },
-        GenSafeWriteValue::FixedV128(source_fixed_addr) => {
-            assert!(bits == BitSize::DQWORD);
-            ctx.builder.load_fixed_v128(source_fixed_addr);
-            ctx.builder.store_unaligned_v128(0);
+        MemOperand::Resolved(_) => {
+            gen_resolved_memory_address(ctx, &entry_local, address_local, common);
+            gen_write_value_tail(ctx, bits, &value_local, 0);
         },
-        GenSafeWriteValue::V128(local) => {
-            assert!(bits == BitSize::DQWORD);
-            ctx.builder.get_local_v128(local);
-            ctx.builder.store_unaligned_v128(0);
-        },
-    }
-    match bits {
-        BitSize::BYTE => {
-            ctx.builder.store_u8(0);
-        },
-        BitSize::WORD => {
-            ctx.builder.store_unaligned_u16(0);
-        },
-        BitSize::DWORD => {
-            ctx.builder.store_unaligned_i32(0);
-        },
-        BitSize::QWORD => {
-            ctx.builder.store_unaligned_i64(0);
-        },
-        BitSize::DQWORD => {}, // handled above
     }
 
     ctx.builder.free_local(entry_local);
+}
+
+/// The `if !can_use_fast_path { safe_write*_slow_jit(addr, value, eip) }`
+/// arm of a read+write access.
+fn gen_rmw_write_slow_check(
+    ctx: &mut JitContext,
+    bits: BitSize,
+    address_local: &WasmLocal,
+    value_local: &GenSafeReadWriteValue,
+    can_use_fast_path_local: &WasmLocal,
+) {
+    ctx.builder.get_local(can_use_fast_path_local);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    {
+        ctx.builder.get_local(address_local);
+
+        match value_local {
+            GenSafeReadWriteValue::I32(l) => ctx.builder.get_local(l),
+            GenSafeReadWriteValue::I64(l) => ctx.builder.get_local_i64(l),
+        }
+
+        // packed lower bits of eip and wasm table index
+        ctx.builder.const_i32(
+            ctx.start_of_current_instruction as i32 & 0xFFF
+                | (ctx.wasm_table_index.to_u16() as i32) << 16,
+        );
+
+        match bits {
+            BitSize::BYTE => {
+                ctx.builder.call_fn3_ret("safe_write8_slow_jit");
+            },
+            BitSize::WORD => {
+                ctx.builder.call_fn3_ret("safe_write16_slow_jit");
+            },
+            BitSize::DWORD => {
+                ctx.builder.call_fn3_ret("safe_write32_slow_jit");
+            },
+            BitSize::QWORD => {
+                ctx.builder
+                    .call_fn3_i32_i64_i32_ret("safe_write64_slow_jit");
+            },
+            BitSize::DQWORD => {
+                dbg_assert!(false);
+            },
+        }
+
+        if cfg!(debug_assertions) {
+            ctx.builder.const_i32(1);
+            ctx.builder.and_i32();
+
+            ctx.builder.if_void();
+            {
+                // handled above
+                ctx.builder.const_i32(match bits {
+                    BitSize::BYTE => 8,
+                    BitSize::WORD => 16,
+                    BitSize::DWORD => 32,
+                    BitSize::QWORD => 64,
+                    _ => {
+                        dbg_assert!(false);
+                        0
+                    },
+                });
+                ctx.builder.get_local(address_local);
+                ctx.builder.call_fn2("bug_gen_safe_read_write_page_fault");
+            }
+            ctx.builder.block_end();
+        }
+        else {
+            ctx.builder.drop_();
+        }
+    }
+    ctx.builder.block_end();
+}
+
+/// Emit `value <- f(mem[operand+offset]); mem[operand+offset] <- value`.
+/// The operand emission is `get_local(operand)`; the memarg fold passes the
+/// guest address local and `offset = base`. `can_use_fast_path_local` is
+/// `Some` on slow-path completions, where the write-back check is dynamic;
+/// it is `None` on the guard-passed fast path, where the common guard makes
+/// it statically true.
+fn gen_rmw_tail(
+    ctx: &mut JitContext,
+    bits: BitSize,
+    address_local: &WasmLocal,
+    operand: &WasmLocal,
+    offset: u32,
+    can_use_fast_path_local: Option<&WasmLocal>,
+    f: &dyn Fn(&mut JitContext),
+) {
+    ctx.builder.get_local(operand);
+
+    match bits {
+        BitSize::BYTE => {
+            ctx.builder.load_u8(offset);
+        },
+        BitSize::WORD => {
+            ctx.builder.load_unaligned_u16(offset);
+        },
+        BitSize::DWORD => {
+            ctx.builder.load_unaligned_i32(offset);
+        },
+        BitSize::QWORD => {
+            ctx.builder.load_unaligned_i64(offset);
+        },
+        BitSize::DQWORD => assert!(false), // not used
+    }
+
+    // value is now on stack
+
+    f(ctx);
+
+    // TODO: Could get rid of this local by returning one from f
+    let value_local = if bits == BitSize::QWORD {
+        GenSafeReadWriteValue::I64(ctx.builder.set_new_local_i64())
+    }
+    else {
+        GenSafeReadWriteValue::I32(ctx.builder.set_new_local())
+    };
+
+    if let Some(can_use_fast_path_local) = can_use_fast_path_local {
+        gen_rmw_write_slow_check(
+            ctx,
+            bits,
+            address_local,
+            &value_local,
+            can_use_fast_path_local,
+        );
+    }
+
+    ctx.builder.get_local(operand);
+    match &value_local {
+        GenSafeReadWriteValue::I32(l) => ctx.builder.get_local(l),
+        GenSafeReadWriteValue::I64(l) => ctx.builder.get_local_i64(l),
+    }
+
+    match bits {
+        BitSize::BYTE => {
+            ctx.builder.store_u8(offset);
+        },
+        BitSize::WORD => {
+            ctx.builder.store_unaligned_u16(offset);
+        },
+        BitSize::DWORD => {
+            ctx.builder.store_unaligned_i32(offset);
+        },
+        BitSize::QWORD => {
+            ctx.builder.store_unaligned_i64(offset);
+        },
+        BitSize::DQWORD => {
+            dbg_assert!(false);
+        },
+    }
+
+    match value_local {
+        GenSafeReadWriteValue::I32(l) => ctx.builder.free_local(l),
+        GenSafeReadWriteValue::I64(l) => ctx.builder.free_local_i64(l),
+    }
 }
 
 pub fn gen_safe_read_write(
@@ -1466,9 +1802,11 @@ pub fn gen_safe_read_write(
     //   if !can_use_fast_path { safe_write_jit_slow(addr, value, instruction_pointer) }
     //   mem[(entry & ~0xFFF) ^ addr] <- value
 
+    let done = common_memarg_base(ctx).map(|_| ctx.builder.block_void());
     let cont = ctx.builder.block_void();
-    let (entry_local, common, can_use_fast_path_local) =
-        if let Some((entry, perm)) = gen_common_memory_guard(ctx, address_local) {
+    let (operand, common, can_use_fast_path_local, bail) =
+        if let Some((operand, perm)) = gen_common_memory_guard(ctx, address_local) {
+            let bail = gen_guard_bail_eligible(ctx);
             let can_use_fast_path_local = if bits == BitSize::BYTE {
                 // A single byte never crosses a page; read+write permission suffices.
                 gen_perm_mask_test(ctx, &perm, 3);
@@ -1488,100 +1826,136 @@ pub fn gen_safe_read_write(
             };
             ctx.builder.br_if(cont);
             ctx.builder.free_local(perm);
-            (entry, true, can_use_fast_path_local)
+            (operand, true, can_use_fast_path_local, bail)
         }
         else {
-            let (entry, common) = gen_memory_guard(ctx, address_local, true, true);
+            let (operand, common) = gen_memory_guard(ctx, address_local, true, true);
             if bits != BitSize::BYTE {
                 gen_within_page_test(ctx, address_local, bits.bytes() as i32);
                 ctx.builder.and_i32();
             }
             let can_use_fast_path_local = ctx.builder.tee_new_local();
             ctx.builder.br_if(cont);
-            (entry, common, can_use_fast_path_local)
+            (operand, common, can_use_fast_path_local, false)
         };
+    let entry_local = match &operand {
+        MemOperand::Resolved(l) => l.unsafe_clone(),
+        MemOperand::Guest { .. } => ctx.builder.alloc_local(),
+    };
 
-    if cfg!(feature = "profiler") {
-        ctx.builder.get_local(&address_local);
-        ctx.builder.get_local(&entry_local);
-        ctx.builder.call_fn2("report_safe_read_write_jit_slow");
-    }
-
-    ctx.builder.get_local(&address_local);
-
-    // packed lower bits of eip and wasm table index
-    ctx.builder.const_i32(
-        ctx.start_of_current_instruction as i32 & 0xFFF
-            | (ctx.wasm_table_index.to_u16() as i32) << 16,
-    );
-
-    match bits {
-        BitSize::BYTE => {
-            ctx.builder.call_fn2_ret("safe_read_write8_slow_jit");
-        },
-        BitSize::WORD => {
-            ctx.builder.call_fn2_ret("safe_read_write16_slow_jit");
-        },
-        BitSize::DWORD => {
-            ctx.builder.call_fn2_ret("safe_read_write32s_slow_jit");
-        },
-        BitSize::QWORD => {
-            ctx.builder.call_fn2_ret("safe_read_write64_slow_jit");
-        },
-        BitSize::DQWORD => {
-            dbg_assert!(false);
-        },
-    }
-    ctx.builder.tee_local(&entry_local);
-    ctx.builder.const_i32(1);
-    ctx.builder.and_i32();
-
-    if cfg!(feature = "profiler") {
-        ctx.builder.if_void();
-        gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
-        ctx.builder.block_end();
-
-        ctx.builder.get_local(&entry_local);
-        ctx.builder.const_i32(1);
-        ctx.builder.and_i32();
-    }
-
-    if gen_vec_has_dirty(ctx) || ctx.fault_precharge.is_some() {
-        ctx.builder.if_void();
-        gen_vec_flush_for_cold_path(ctx);
-        if let Some(k) = ctx.fault_precharge {
-            // On a real CPU exception (bit 1 of the slow helper's exit code)
-            // undo the pre-charge for the instructions after the faulting one;
-            // the interpreter counts the faulting instruction as retired. A
-            // bail (bit 1 clear, e.g. SMC) keeps the full pre-charge exactly as
-            // before. gen_update_instruction_counter publishes the local.
-            if k > 1 {
-                ctx.builder.get_local(&ctx.instruction_counter);
-                ctx.builder.const_i32(k as i32 - 1);
-                ctx.builder.get_local(&entry_local);
-                ctx.builder.const_i32(1);
-                ctx.builder.shr_u_i32();
-                ctx.builder.const_i32(1);
-                ctx.builder.and_i32();
-                ctx.builder.mul_i32();
-                ctx.builder.sub_i32();
-                ctx.builder.set_local(&ctx.instruction_counter);
-            }
-        }
-        ctx.builder.br(ctx.exit_with_fault_label);
-        ctx.builder.block_end();
+    if common && bail {
+        unsafe { crate::jit::GUARD_EXIT_SITES = crate::jit::GUARD_EXIT_SITES.wrapping_add(1) };
+        gen_guard_bail(ctx);
     }
     else {
-        ctx.builder.br_if(ctx.exit_with_fault_label);
-    }
-    if common {
-        gen_resolved_memory_address(ctx, &entry_local, address_local, false);
-        ctx.builder.set_local(&entry_local);
-    }
+        if common && (unsafe { crate::jit::JIT_GUARD_EXIT }) & 1 != 0 {
+            unsafe { crate::jit::GUARD_KEPT_SITES = crate::jit::GUARD_KEPT_SITES.wrapping_add(1) };
+        }
+        if cfg!(feature = "profiler") {
+            ctx.builder.get_local(&address_local);
+            ctx.builder.get_local(&entry_local);
+            ctx.builder.call_fn2("report_safe_read_write_jit_slow");
+        }
 
+        ctx.builder.get_local(&address_local);
+
+        // packed lower bits of eip and wasm table index
+        ctx.builder.const_i32(
+            ctx.start_of_current_instruction as i32 & 0xFFF
+                | (ctx.wasm_table_index.to_u16() as i32) << 16,
+        );
+
+        match bits {
+            BitSize::BYTE => {
+                ctx.builder.call_fn2_ret("safe_read_write8_slow_jit");
+            },
+            BitSize::WORD => {
+                ctx.builder.call_fn2_ret("safe_read_write16_slow_jit");
+            },
+            BitSize::DWORD => {
+                ctx.builder.call_fn2_ret("safe_read_write32s_slow_jit");
+            },
+            BitSize::QWORD => {
+                ctx.builder.call_fn2_ret("safe_read_write64_slow_jit");
+            },
+            BitSize::DQWORD => {
+                dbg_assert!(false);
+            },
+        }
+        ctx.builder.tee_local(&entry_local);
+        ctx.builder.const_i32(1);
+        ctx.builder.and_i32();
+
+        if cfg!(feature = "profiler") {
+            ctx.builder.if_void();
+            gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
+            ctx.builder.block_end();
+
+            ctx.builder.get_local(&entry_local);
+            ctx.builder.const_i32(1);
+            ctx.builder.and_i32();
+        }
+
+        if gen_vec_has_dirty(ctx) || ctx.fault_precharge.is_some() {
+            ctx.builder.if_void();
+            gen_vec_flush_for_cold_path(ctx);
+            if let Some(k) = ctx.fault_precharge {
+                // On a real CPU exception (bit 1 of the slow helper's exit code)
+                // undo the pre-charge for the instructions after the faulting one;
+                // the interpreter counts the faulting instruction as retired. A
+                // bail (bit 1 clear, e.g. SMC) keeps the full pre-charge exactly as
+                // before. gen_update_instruction_counter publishes the local.
+                if k > 1 {
+                    ctx.builder.get_local(&ctx.instruction_counter);
+                    ctx.builder.const_i32(k as i32 - 1);
+                    ctx.builder.get_local(&entry_local);
+                    ctx.builder.const_i32(1);
+                    ctx.builder.shr_u_i32();
+                    ctx.builder.const_i32(1);
+                    ctx.builder.and_i32();
+                    ctx.builder.mul_i32();
+                    ctx.builder.sub_i32();
+                    ctx.builder.set_local(&ctx.instruction_counter);
+                }
+            }
+            ctx.builder.br(ctx.exit_with_fault_label);
+            ctx.builder.block_end();
+        }
+        else {
+            ctx.builder.br_if(ctx.exit_with_fault_label);
+        }
+        if common {
+            gen_resolved_memory_address(ctx, &entry_local, address_local, false);
+            ctx.builder.set_local(&entry_local);
+        }
+        if let Some(done) = done {
+            gen_rmw_tail(
+                ctx,
+                bits,
+                address_local,
+                &entry_local,
+                0,
+                Some(&can_use_fast_path_local),
+                f,
+            );
+            ctx.builder.br(done);
+        }
+    }
     ctx.builder.block_end();
 
     gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_READ_WRITE_FAST); // XXX: Also slow
+
+    match &operand {
+        MemOperand::Guest { base } => {
+            gen_rmw_tail(ctx, bits, address_local, address_local, *base, None, f);
+            ctx.builder.block_end();
+
+            ctx.builder.free_local(can_use_fast_path_local);
+            ctx.builder.free_local(entry_local);
+            return;
+        },
+        MemOperand::Resolved(_) => {},
+    }
 
     gen_resolved_memory_address(ctx, &entry_local, address_local, common);
 

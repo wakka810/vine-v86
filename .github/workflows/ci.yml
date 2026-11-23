@@ -56,7 +56,8 @@ jobs:
 
       - name: Run Vine CPU regressions
         run: >-
-          make vine-jit-budget-test vine-jit-chaining-test vine-jit-leaf-copy-test
+          make vine-jit-budget-test vine-jit-boundary-test vine-jit-chaining-test
+          vine-jit-leaf-copy-test vine-jit-page-tail-test vine-jit-guard-exit-test
           vine-jit-affine-ram-test vine-x87-performance-test vine-mmx-simd-test
 
       - name: rustfmt check

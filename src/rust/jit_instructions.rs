@@ -85,6 +85,8 @@ pub fn jit_instruction(ctx: &mut JitContext, instr_flags: &mut u32) {
             .position(|&a| a == ctx.cpu.eip)
             .map(|i| starts.len() as u32 - i as u32)
     });
+    ctx.instr_state_dirty = false;
+    ctx.instr_calls_base = ctx.builder.imported_call_count();
     gen::jit::jit(
         ctx.cpu.read_imm8() as u32 | (ctx.cpu.osize_32() as u32) << 8,
         ctx,
@@ -3267,7 +3269,7 @@ pub fn instr32_60_jit(ctx: &mut JitContext) {
         ctx.builder.const_i32(32);
         ctx.builder.sub_i32();
         let addr = ctx.builder.set_new_local();
-        let (entry, common) = codegen::gen_memory_guard(ctx, &addr, false, true);
+        let (operand, common) = codegen::gen_memory_guard(ctx, &addr, false, true);
         ctx.builder.get_local(&addr);
         ctx.builder.const_i32(0xFFF);
         ctx.builder.and_i32();
@@ -3277,7 +3279,12 @@ pub fn instr32_60_jit(ctx: &mut JitContext) {
         ctx.builder.eqz_i32();
         ctx.builder.br_if(slow);
 
-        codegen::gen_resolved_memory_address(ctx, &entry, &addr, common);
+        match &operand {
+            codegen::MemOperand::Guest { .. } => ctx.builder.get_local(&addr),
+            codegen::MemOperand::Resolved(entry) => {
+                codegen::gen_resolved_memory_address(ctx, entry, &addr, common);
+            },
+        }
         let phys = ctx.builder.set_new_local();
         let order = [
             (0u32, regs::EDI),
@@ -3292,12 +3299,14 @@ pub fn instr32_60_jit(ctx: &mut JitContext) {
         for (offset, reg) in order {
             ctx.builder.get_local(&phys);
             codegen::gen_get_reg32(ctx, reg);
-            ctx.builder.store_unaligned_i32(offset);
+            ctx.builder.store_unaligned_i32(offset + operand.extra());
         }
         ctx.builder.get_local(&addr);
         codegen::gen_set_reg32(ctx, regs::ESP);
         ctx.builder.free_local(phys);
-        ctx.builder.free_local(entry);
+        if let codegen::MemOperand::Resolved(entry) = operand {
+            ctx.builder.free_local(entry);
+        }
         ctx.builder.free_local(addr);
         ctx.builder.br(done);
         ctx.builder.block_end();
@@ -3339,7 +3348,7 @@ pub fn instr32_61_jit(ctx: &mut JitContext) {
         let slow = ctx.builder.block_void();
         codegen::gen_get_reg32(ctx, regs::ESP);
         let addr = ctx.builder.set_new_local();
-        let (entry, common) = codegen::gen_memory_guard(ctx, &addr, true, false);
+        let (operand, common) = codegen::gen_memory_guard(ctx, &addr, true, false);
         ctx.builder.get_local(&addr);
         ctx.builder.const_i32(0xFFF);
         ctx.builder.and_i32();
@@ -3349,7 +3358,12 @@ pub fn instr32_61_jit(ctx: &mut JitContext) {
         ctx.builder.eqz_i32();
         ctx.builder.br_if(slow);
 
-        codegen::gen_resolved_memory_address(ctx, &entry, &addr, common);
+        match &operand {
+            codegen::MemOperand::Guest { .. } => ctx.builder.get_local(&addr),
+            codegen::MemOperand::Resolved(entry) => {
+                codegen::gen_resolved_memory_address(ctx, entry, &addr, common);
+            },
+        }
         let phys = ctx.builder.set_new_local();
         let order = [
             (0u32, regs::EDI),
@@ -3362,7 +3376,7 @@ pub fn instr32_61_jit(ctx: &mut JitContext) {
         ];
         for (offset, reg) in order {
             ctx.builder.get_local(&phys);
-            ctx.builder.load_unaligned_i32(offset);
+            ctx.builder.load_unaligned_i32(offset + operand.extra());
             codegen::gen_set_reg32(ctx, reg);
         }
         ctx.builder.get_local(&addr);
@@ -3370,7 +3384,9 @@ pub fn instr32_61_jit(ctx: &mut JitContext) {
         ctx.builder.add_i32();
         codegen::gen_set_reg32(ctx, regs::ESP);
         ctx.builder.free_local(phys);
-        ctx.builder.free_local(entry);
+        if let codegen::MemOperand::Resolved(entry) = operand {
+            ctx.builder.free_local(entry);
+        }
         ctx.builder.free_local(addr);
         ctx.builder.br(done);
         ctx.builder.block_end();

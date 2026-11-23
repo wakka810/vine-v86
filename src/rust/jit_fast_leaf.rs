@@ -989,12 +989,18 @@ fn emit_guarded_read(
     }
     else {
         ctx.builder.get_local(&addr_local);
-        ctx.builder.const_i32(common_base as i32);
-        ctx.builder.add_i32();
+        let off = if codegen::common_memarg_base(ctx).is_some() {
+            common_base
+        }
+        else {
+            ctx.builder.const_i32(common_base as i32);
+            ctx.builder.add_i32();
+            0
+        };
         match size {
-            1 => ctx.builder.load_u8(0),
-            2 => ctx.builder.load_unaligned_u16(0),
-            4 => ctx.builder.load_unaligned_i32(0),
+            1 => ctx.builder.load_u8(off),
+            2 => ctx.builder.load_unaligned_u16(off),
+            4 => ctx.builder.load_unaligned_i32(off),
             _ => unreachable!(),
         }
     }
@@ -1703,9 +1709,15 @@ pub fn generate(
                 }
                 else {
                     ctx.builder.get_local(&addr_local);
-                    ctx.builder.const_i32(common_base as i32);
-                    ctx.builder.add_i32();
-                    ctx.builder.load_unaligned_i32(0);
+                    let off = if codegen::common_memarg_base(ctx).is_some() {
+                        common_base
+                    }
+                    else {
+                        ctx.builder.const_i32(common_base as i32);
+                        ctx.builder.add_i32();
+                        0
+                    };
+                    ctx.builder.load_unaligned_i32(off);
                 }
                 let lhs = ctx.builder.set_new_local();
                 get_reg32_shadow(ctx, &shadow, src);
@@ -1766,9 +1778,15 @@ pub fn generate(
                 }
                 else {
                     ctx.builder.get_local(&addr_local);
-                    ctx.builder.const_i32(common_base as i32);
-                    ctx.builder.add_i32();
-                    ctx.builder.load_unaligned_i32(0);
+                    let off = if codegen::common_memarg_base(ctx).is_some() {
+                        common_base
+                    }
+                    else {
+                        ctx.builder.const_i32(common_base as i32);
+                        ctx.builder.add_i32();
+                        0
+                    };
+                    ctx.builder.load_unaligned_i32(off);
                 }
                 let lhs = ctx.builder.set_new_local();
                 ctx.builder.const_i32(imm);
@@ -1869,20 +1887,32 @@ pub fn generate(
 
     // 1. Commit return address word [ESP - 4] = ret_virt_addr (architectural red-zone bytes).
     ctx.builder.get_local(&ret_slot_addr);
-    ctx.builder.const_i32(common_base as i32);
-    ctx.builder.add_i32();
-    ctx.builder.get_local(&ret_virt_addr);
-    ctx.builder.store_unaligned_i32(0);
+    if codegen::common_memarg_base(ctx).is_some() {
+        ctx.builder.get_local(&ret_virt_addr);
+        ctx.builder.store_unaligned_i32(common_base);
+    }
+    else {
+        ctx.builder.const_i32(common_base as i32);
+        ctx.builder.add_i32();
+        ctx.builder.get_local(&ret_virt_addr);
+        ctx.builder.store_unaligned_i32(0);
+    }
 
     // 2. Commit buffered leaf writes in exact program order.
     for pw in pending_writes.drain(..) {
         ctx.builder.get_local(&pw.addr);
-        ctx.builder.const_i32(common_base as i32);
-        ctx.builder.add_i32();
+        let off = if codegen::common_memarg_base(ctx).is_some() {
+            common_base
+        }
+        else {
+            ctx.builder.const_i32(common_base as i32);
+            ctx.builder.add_i32();
+            0
+        };
         ctx.builder.get_local(&pw.val);
         match pw.size {
-            1 => ctx.builder.store_u8(0),
-            4 => ctx.builder.store_unaligned_i32(0),
+            1 => ctx.builder.store_u8(off),
+            4 => ctx.builder.store_unaligned_i32(off),
             _ => unreachable!(),
         }
         ctx.builder.free_local(pw.val);
